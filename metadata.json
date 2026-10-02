@@ -1,0 +1,8 @@
+{
+  "name": "VisionQC",
+  "description": "Industrial machine-vision quality inspection system using unsupervised normal appearance learning from good samples.",
+  "requestFramePermissions": [
+    "CAMERA"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

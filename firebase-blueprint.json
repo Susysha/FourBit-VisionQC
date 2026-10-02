@@ -1,0 +1,109 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User account profile for VisionQC operator or quality engineer",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Unique Firebase Authentication UID of the user"
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Full name of the operator"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Registered email address"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp string when user profile was created"
+        }
+      },
+      "required": [
+        "userId",
+        "fullName",
+        "email",
+        "createdAt"
+      ]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "An inspected industrial product part created by the operator",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "sku": { "type": "string" },
+        "category": { "type": "string" },
+        "nominalThreshold": { "type": "number" },
+        "sampleCount": { "type": "number" },
+        "activeLine": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "name", "sku", "category", "nominalThreshold", "sampleCount", "activeLine", "createdAt"]
+    },
+    "DatasetItem": {
+      "title": "DatasetItem",
+      "description": "A real normal reference image uploaded for a product dataset",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "productId": { "type": "string" },
+        "productName": { "type": "string" },
+        "fileName": { "type": "string" },
+        "dataUrl": { "type": "string" },
+        "label": { "type": "string" },
+        "resolution": { "type": "string" },
+        "fileSize": { "type": "string" },
+        "uploadedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "productId", "productName", "fileName", "label", "resolution", "uploadedAt"]
+    },
+    "InspectionRecord": {
+      "title": "InspectionRecord",
+      "description": "A recorded visual inspection outcome created by user action",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "productId": { "type": "string" },
+        "productName": { "type": "string" },
+        "partSku": { "type": "string" },
+        "status": { "type": "string" },
+        "anomalyScore": { "type": "number" },
+        "threshold": { "type": "number" },
+        "batchNumber": { "type": "string" },
+        "operator": { "type": "string" },
+        "inspectionLine": { "type": "string" },
+        "imagePath": { "type": "string" },
+        "imageDataUrl": { "type": "string" }
+      },
+      "required": ["id", "userId", "timestamp", "productName", "status", "anomalyScore", "threshold"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Private user profile documents, accessible only by the owner"
+    },
+    "/users/{userId}/products/{productId}": {
+      "schema": "Product",
+      "description": "User-isolated product definitions created explicitly by the operator"
+    },
+    "/users/{userId}/datasets/{datasetId}": {
+      "schema": "DatasetItem",
+      "description": "User-isolated normal dataset sample images"
+    },
+    "/users/{userId}/inspections/{inspectionId}": {
+      "schema": "InspectionRecord",
+      "description": "User-isolated visual inspection records"
+    }
+  }
+}
