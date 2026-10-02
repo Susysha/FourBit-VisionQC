@@ -198,6 +198,10 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
   const trackerRef = useRef<LiveConveyorTracker>(new LiveConveyorTracker(roiConfig, liveInspectionFps));
   const memoryBankCacheRef = useRef<Map<string, { bank: PatchCoreMemoryBank; count: number }>>(new Map());
   const loopIntervalRef = useRef<number | null>(null);
+  // Monotonically-incrementing token that identifies the current inspection cycle.
+  // Captured at the start of handleAutoInspect; compared before any result is applied
+  // to discard results that arrived after the product exited or a new cycle started.
+  const inspectionTokenRef = useRef<number>(0);
 
   // 1. Load normal reference images for current product from users/{userId}/datasets
   useEffect(() => {
@@ -435,13 +439,29 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
       return;
     }
 
+    // Capture the cycle token BEFORE the first await so we can detect staleness later.
+    const myToken = ++inspectionTokenRef.current;
+
     const effectiveThreshold = currentProduct.nominalThreshold ?? threshold ?? 0.50;
     setIsAnalyzing(true);
     setAnalysisStep('Analyzing candidate frame...');
 
     try {
       const bank = await ensureMemoryBank();
+
+      // Guard: a newer cycle started while we were building the memory bank.
+      if (inspectionTokenRef.current !== myToken) {
+        trackerRef.current.recordInferenceSkipped('Superseded by newer inspection cycle');
+        return;
+      }
+
       const result = await inspectImageWithPatchCore(frameDataUrl, bank, effectiveThreshold);
+
+      // Guard: the product may have exited during inference – discard stale result.
+      if (inspectionTokenRef.current !== myToken) {
+        trackerRef.current.recordInferenceSkipped('Result arrived after product exited');
+        return;
+      }
 
       if (result.result === 'INVALID') {
         trackerRef.current.recordInferenceSkipped(result.qualityIssue || 'Image quality below tolerance');
@@ -474,6 +494,12 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
       const compressedInspectionImage = await compressImageForStorage(frameDataUrl, 800, 0.82);
       const compressedOverlay = await compressImageForStorage(result.overlayDataUrl, 800, 0.82);
       const compressedHeatmap = await compressImageForStorage(result.heatmapDataUrl, 400, 0.80);
+
+      // Final staleness guard before the Firestore write.
+      if (inspectionTokenRef.current !== myToken) {
+        trackerRef.current.recordInferenceSkipped('Firestore write cancelled – result superseded');
+        return;
+      }
 
       const inspectionRecord: InspectionRecord = {
         id: recordId,
@@ -875,24 +901,39 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
                 </button>
                 {inspectionResult && (
                   <>
-                    <button
-                      type="button"
-                      onClick={() => setActiveViewMode('overlay')}
-                      className={`px-2.5 py-1 rounded transition-colors ${
-                        activeViewMode === 'overlay' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      Overlay + Defect
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setActiveViewMode('heatmap')}
-                      className={`px-2.5 py-1 rounded transition-colors ${
-                        activeViewMode === 'heatmap' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      Heatmap
-                    </button>
+                    {capturedImage && (
+                      <button
+                        type="button"
+                        onClick={() => setActiveViewMode('original')}
+                        className={`px-2.5 py-1 rounded transition-colors ${
+                          activeViewMode === 'original' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        Original
+                      </button>
+                    )}
+                    {inspectionResult.overlayDataUrl && (
+                      <button
+                        type="button"
+                        onClick={() => setActiveViewMode('overlay')}
+                        className={`px-2.5 py-1 rounded transition-colors ${
+                          activeViewMode === 'overlay' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        Overlay
+                      </button>
+                    )}
+                    {inspectionResult.heatmapDataUrl && (
+                      <button
+                        type="button"
+                        onClick={() => setActiveViewMode('heatmap')}
+                        className={`px-2.5 py-1 rounded transition-colors ${
+                          activeViewMode === 'heatmap' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        Heatmap
+                      </button>
+                    )}
                   </>
                 )}
               </div>
@@ -1043,38 +1084,66 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
                       </div>
                     </div>
                   ) : currentLiveResult ? (
-                    <div className={`rounded-xl px-5 py-3 font-mono text-xs shadow-2xl backdrop-blur-md flex items-center justify-between gap-6 border-2 transition-all ${
+                    <div className={`rounded-xl px-4 py-3 font-mono text-xs shadow-2xl backdrop-blur-md border-2 transition-all ${
                       currentLiveResult.result === 'PASS'
                         ? 'bg-slate-950/90 border-emerald-500 text-white'
                         : 'bg-slate-950/90 border-rose-500 text-white'
                     }`}>
-                      <div className="flex items-center gap-3">
-                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-                          currentLiveResult.result === 'PASS' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
-                        }`}>
-                          {currentLiveResult.result === 'PASS' ? (
-                            <CheckCircle2 className="w-6 h-6" />
-                          ) : (
-                            <XCircle className="w-6 h-6" />
-                          )}
-                        </div>
-                        <div>
-                          <div className="text-sm font-bold flex items-center gap-2">
-                            <span>{currentLiveResult.result === 'PASS' ? 'PASS ✓' : 'FAIL ⚠'}</span>
-                            <span className="text-[11px] font-normal text-slate-400">Product #{currentLiveResult.productIndex}</span>
+                      {/* Top row: verdict + timestamp */}
+                      <div className="flex items-center justify-between gap-4 mb-2">
+                        <div className="flex items-center gap-2.5">
+                          <div className={`w-7 h-7 rounded-md flex items-center justify-center shrink-0 ${
+                            currentLiveResult.result === 'PASS' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
+                          }`}>
+                            {currentLiveResult.result === 'PASS' ? (
+                              <CheckCircle2 className="w-5 h-5" />
+                            ) : (
+                              <XCircle className="w-5 h-5" />
+                            )}
                           </div>
-                          <div className="text-[11px] text-slate-300">
-                            Score: <strong>{currentLiveResult.anomalyScore.toFixed(2)}</strong> (Limit: {currentLiveResult.threshold.toFixed(2)})
-                            {currentLiveResult.defectRegion && (
-                              <span className="text-rose-400 ml-2">· Defect Detected ({currentLiveResult.defectRegion.confidence}%)</span>
+                          <div>
+                            <div className={`text-sm font-bold ${
+                              currentLiveResult.result === 'PASS' ? 'text-emerald-400' : 'text-rose-400'
+                            }`}>
+                              {currentLiveResult.result === 'PASS' ? 'PASS ✓' : 'FAIL ✗'}
+                              <span className="text-[11px] font-normal text-slate-400 ml-2">Product #{currentLiveResult.productIndex}</span>
+                            </div>
+                            {currentLiveResult.result === 'FAIL' && (
+                              <div className="text-[10px] text-rose-300 mt-0.5">Anomaly score exceeded rejection threshold.</div>
                             )}
                           </div>
                         </div>
+                        <div className="text-right text-[10px] text-slate-400 shrink-0">
+                          <div>{currentLiveResult.timestamp}</div>
+                        </div>
                       </div>
-
-                      <div className="text-right text-[10px] text-slate-400">
-                        <div>Logged to Firestore</div>
-                        <div>{currentLiveResult.timestamp}</div>
+                      {/* Score bar */}
+                      <div className="space-y-1">
+                        <div className="flex justify-between text-[10px] text-slate-400">
+                          <span>Anomaly Score</span>
+                          <span className="tabular-nums">
+                            <strong className={currentLiveResult.result === 'FAIL' ? 'text-rose-400' : 'text-emerald-400'}>
+                              {currentLiveResult.anomalyScore.toFixed(3)}
+                            </strong>
+                            {' '}/ limit {currentLiveResult.threshold.toFixed(2)}
+                          </span>
+                        </div>
+                        <div className="relative h-1.5 rounded-full bg-slate-700 overflow-hidden">
+                          <div
+                            className={`absolute inset-y-0 left-0 rounded-full transition-all ${
+                              currentLiveResult.result === 'PASS' ? 'bg-emerald-500' : 'bg-rose-500'
+                            }`}
+                            style={{ width: `${Math.min(currentLiveResult.anomalyScore / Math.max(currentLiveResult.threshold, 0.001) * 100, 100).toFixed(1)}%` }}
+                          />
+                          {/* Threshold marker */}
+                          <div className="absolute inset-y-0 bg-amber-400/80" style={{ left: '100%', width: '1.5px', transform: 'translateX(-0.75px)' }} />
+                        </div>
+                        {currentLiveResult.defectRegion && (
+                          <div className="text-[10px] text-rose-300 flex items-center gap-1 pt-0.5">
+                            <AlertTriangle className="w-3 h-3" />
+                            Defect region detected · confidence {currentLiveResult.defectRegion.confidence}%
+                          </div>
+                        )}
                       </div>
                     </div>
                   ) : (
@@ -1527,6 +1596,143 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
               </div>
               <div className="text-[10px] text-blue-600">
                 Visible in History audit trail &amp; Dashboard live metrics.
+              </div>
+            </div>
+          )}
+
+          {/* LAST RESULT DETAIL CARD */}
+          {inspectionResult && inspectionResult.result !== 'INVALID' && (
+            <div className={`bg-white border rounded-xl shadow-xs font-mono overflow-hidden ${
+              inspectionResult.result === 'PASS' ? 'border-emerald-300' : 'border-rose-300'
+            }`}>
+              {/* Verdict header */}
+              <div className={`px-4 py-3 flex items-center justify-between ${
+                inspectionResult.result === 'PASS'
+                  ? 'bg-emerald-50 border-b border-emerald-200'
+                  : 'bg-rose-50 border-b border-rose-200'
+              }`}>
+                <div className="flex items-center gap-2">
+                  {inspectionResult.result === 'PASS' ? (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  ) : (
+                    <XCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                  )}
+                  <span className={`text-sm font-bold ${
+                    inspectionResult.result === 'PASS' ? 'text-emerald-800' : 'text-rose-800'
+                  }`}>
+                    {inspectionResult.result === 'PASS' ? 'PASS — Conformant' : 'FAIL — Rejected'}
+                  </span>
+                </div>
+                <span className="text-[10px] text-slate-400">{inspectionResult.inferenceTimeMs} ms</span>
+              </div>
+
+              <div className="p-4 space-y-3 text-[11px] text-slate-600">
+                {/* Rejection reason */}
+                {inspectionResult.result === 'FAIL' && (
+                  <div className="flex items-start gap-2 p-2 bg-rose-50 border border-rose-200 rounded-lg text-rose-800">
+                    <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-rose-600" />
+                    <span>Anomaly score exceeded the configured rejection threshold.</span>
+                  </div>
+                )}
+
+                {/* Score vs threshold */}
+                <div className="space-y-1.5">
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Anomaly Score</span>
+                    <span className={`font-bold tabular-nums ${
+                      inspectionResult.result === 'FAIL' ? 'text-rose-700' : 'text-emerald-700'
+                    }`}>{inspectionResult.anomalyScore.toFixed(4)}</span>
+                  </div>
+                  <div className="relative h-2 rounded-full bg-slate-100 overflow-hidden">
+                    <div
+                      className={`absolute inset-y-0 left-0 rounded-full ${
+                        inspectionResult.result === 'PASS' ? 'bg-emerald-500' : 'bg-rose-500'
+                      }`}
+                      style={{
+                        width: `${Math.min(
+                          (inspectionResult.anomalyScore / Math.max(effectiveThreshold, 0.001)) * 100,
+                          100
+                        ).toFixed(1)}%`,
+                      }}
+                    />
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Rejection Threshold</span>
+                    <span className="font-semibold text-blue-700 tabular-nums">{effectiveThreshold.toFixed(4)}</span>
+                  </div>
+                </div>
+
+                {/* Defect region */}
+                {inspectionResult.suspectedDefectRegion && (
+                  <div className="pt-2 border-t border-slate-100 space-y-1">
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Defect Region</span>
+                      <span className="font-semibold text-rose-700">
+                        {inspectionResult.suspectedDefectRegion.width}×{inspectionResult.suspectedDefectRegion.height} px
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Region Confidence</span>
+                      <span className="font-semibold text-rose-700">
+                        {inspectionResult.suspectedDefectRegion.confidence}%
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Peak Location</span>
+                      <span className="font-semibold text-slate-900 tabular-nums">
+                        ({inspectionResult.maxAnomalyCoord.x}px, {inspectionResult.maxAnomalyCoord.y}px)
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Image views shortcut */}
+                {(inspectionResult.overlayDataUrl || inspectionResult.heatmapDataUrl) && (
+                  <div className="pt-2 border-t border-slate-100">
+                    <p className="text-[10px] text-slate-400 mb-1.5">Switch viewport view:</p>
+                    <div className="flex gap-1.5 flex-wrap">
+                      {capturedImage && (
+                        <button
+                          type="button"
+                          onClick={() => setActiveViewMode('original')}
+                          className={`px-2.5 py-1 rounded text-[10px] font-semibold border transition-colors cursor-pointer ${
+                            activeViewMode === 'original'
+                              ? 'bg-slate-900 text-white border-slate-900'
+                              : 'bg-white text-slate-600 border-slate-300 hover:border-slate-500'
+                          }`}
+                        >
+                          Original
+                        </button>
+                      )}
+                      {inspectionResult.overlayDataUrl && (
+                        <button
+                          type="button"
+                          onClick={() => setActiveViewMode('overlay')}
+                          className={`px-2.5 py-1 rounded text-[10px] font-semibold border transition-colors cursor-pointer ${
+                            activeViewMode === 'overlay'
+                              ? 'bg-slate-900 text-white border-slate-900'
+                              : 'bg-white text-slate-600 border-slate-300 hover:border-slate-500'
+                          }`}
+                        >
+                          Overlay
+                        </button>
+                      )}
+                      {inspectionResult.heatmapDataUrl && (
+                        <button
+                          type="button"
+                          onClick={() => setActiveViewMode('heatmap')}
+                          className={`px-2.5 py-1 rounded text-[10px] font-semibold border transition-colors cursor-pointer ${
+                            activeViewMode === 'heatmap'
+                              ? 'bg-slate-900 text-white border-slate-900'
+                              : 'bg-white text-slate-600 border-slate-300 hover:border-slate-500'
+                          }`}
+                        >
+                          Heatmap
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           )}

@@ -412,12 +412,12 @@ export class LiveConveyorTracker {
           this.candidateBuffer.shift();
         }
 
-        // When product stabilizes or maximum candidates buffered, ready for inspection
-        if (analysis.isStable || this.candidateBuffer.length >= 3) {
-          this.state = 'READY_FOR_INSPECTION';
-        } else if (analysis.occupancyScore < OCCUPANCY_THRESHOLD_EXIT) {
+        // Check if product exited ROI before attempting inspection transition
+        if (analysis.occupancyScore < OCCUPANCY_THRESHOLD_EXIT) {
           // Product rushed past without settling
           this.recordInferenceSkipped('Product exited ROI before stabilization');
+        } else if (analysis.isStable || this.candidateBuffer.length >= 3) {
+          this.state = 'READY_FOR_INSPECTION';
         }
         break;
       }
