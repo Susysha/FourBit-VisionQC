@@ -330,8 +330,8 @@ Potential improvements include:
 
 # 9. Team Members
 
-| Team Member | Role |
-|---|---|
+| Team Member | 
+|---|
 | **[Anuj Jha]** | 
 | **[Sushmita Devkar]** | 
 | **[Chandan Gupta]** | 
@@ -344,15 +344,15 @@ Potential improvements include:
 | Field | Details |
 |---|---|
 | **Project Title** | VisionQC |
-| **Problem Statement** | [Problem Statement Name] |
-| **Selected Domain** | [Selected Domain] |
-| **Team Name** | [Team Name] |
+| **Problem Statement** | [VisionQC] |
+| **Selected Domain** | [Ai/ML] |
+| **Team Name** | [FourBit] |
 
 ---
 
 # 11. GitHub Repository
 
-**Repository:** `<GITHUB-REPOSITORY-LINK>`
+**Repository:** `github.com/Susysha/FourBit-VisionQC>`
 
 The repository contains the complete project source code, configuration, and documentation required to run the application locally.
 
