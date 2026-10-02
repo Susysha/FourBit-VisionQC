@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { ProductPart, InspectionRecord, NavSection, DefectRegion } from '../types';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { ProductPart, InspectionRecord, NavSection, DefectRegion, QualityStatus } from '../types';
 import { useAuth } from '../contexts/AuthContext';
 import { getUserDatasets } from '../services/firebase';
 import { getProductDataset } from '../services/datasetStore';
@@ -10,6 +10,14 @@ import {
   PatchCoreInspectionResult,
   compressImageForStorage 
 } from '../services/patchcore';
+import {
+  LiveConveyorTracker,
+  ConveyorState,
+  RoiNormalized,
+  LiveDiagnostics,
+  DEFAULT_LIVE_INSPECTION_FPS,
+  DEFAULT_ROI_NORMALIZED,
+} from '../services/liveInspection';
 import { 
   Camera, 
   Video, 
@@ -18,26 +26,24 @@ import {
   CheckCircle2, 
   XCircle, 
   AlertTriangle, 
-  RefreshCw, 
-  Eye, 
-  AlertCircle,
-  HelpCircle,
+  Play, 
+  Square,
   Sparkles,
-  Zap,
-  FolderGit2,
   ArrowRight,
-  Maximize2,
   Crosshair,
   Layers,
   Image as ImageIcon,
-  Clock,
   Trash2,
   FileCheck,
-  Play,
   Activity,
   Flame,
   Loader2,
-  ExternalLink
+  Sliders,
+  ShieldCheck,
+  Box,
+  TrendingUp,
+  Cpu,
+  AlertCircle
 } from 'lucide-react';
 
 interface InspectionViewProps {
@@ -46,16 +52,17 @@ interface InspectionViewProps {
   threshold: number;
   audibleAlerts?: boolean;
   onUpdateThreshold: (val: number) => void;
-  onSelectProduct: (p: ProductPart) => void;
+  onSelectProduct: (product: ProductPart) => void;
   onRecordInspection: (record: InspectionRecord) => void;
   onNavigate?: (section: NavSection) => void;
   onCreateProduct?: () => void;
 }
 
 type ViewMode = 'live' | 'original' | 'heatmap' | 'overlay';
+type StationTab = 'conveyor' | 'manual';
 
 /**
- * Web Audio Synthesizer for industrial pass/fail audio feedback
+ * Web Audio API Industrial Audio Feedback
  */
 function playIndustrialAlert(isPass: boolean) {
   try {
@@ -65,54 +72,33 @@ function playIndustrialAlert(isPass: boolean) {
     const now = ctx.currentTime;
 
     if (isPass) {
-      // Pleasant dual chime (880Hz then 1174Hz)
+      // Crisp dual-tone industrial acceptance beep
       const osc1 = ctx.createOscillator();
       const gain1 = ctx.createGain();
       osc1.type = 'sine';
       osc1.frequency.setValueAtTime(880, now);
-      gain1.gain.setValueAtTime(0.08, now);
-      gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+      osc1.frequency.exponentialRampToValueAtTime(1320, now + 0.08);
+      gain1.gain.setValueAtTime(0.12, now);
+      gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
       osc1.connect(gain1);
       gain1.connect(ctx.destination);
       osc1.start(now);
-      osc1.stop(now + 0.15);
-
-      const osc2 = ctx.createOscillator();
-      const gain2 = ctx.createGain();
-      osc2.type = 'sine';
-      osc2.frequency.setValueAtTime(1174.66, now + 0.1);
-      gain2.gain.setValueAtTime(0.08, now + 0.1);
-      gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
-      osc2.connect(gain2);
-      gain2.connect(ctx.destination);
-      osc2.start(now + 0.1);
-      osc2.stop(now + 0.3);
+      osc1.stop(now + 0.12);
     } else {
-      // Warning double reject buzz (330Hz then 220Hz)
+      // Industrial rejection buzz
       const osc1 = ctx.createOscillator();
       const gain1 = ctx.createGain();
       osc1.type = 'sawtooth';
-      osc1.frequency.setValueAtTime(330, now);
-      gain1.gain.setValueAtTime(0.12, now);
-      gain1.gain.exponentialRampToValueAtTime(0.01, now + 0.18);
+      osc1.frequency.setValueAtTime(180, now);
+      gain1.gain.setValueAtTime(0.18, now);
+      gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
       osc1.connect(gain1);
       gain1.connect(ctx.destination);
       osc1.start(now);
-      osc1.stop(now + 0.18);
-
-      const osc2 = ctx.createOscillator();
-      const gain2 = ctx.createGain();
-      osc2.type = 'sawtooth';
-      osc2.frequency.setValueAtTime(220, now + 0.2);
-      gain2.gain.setValueAtTime(0.12, now + 0.2);
-      gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.42);
-      osc2.connect(gain2);
-      gain2.connect(ctx.destination);
-      osc2.start(now + 0.2);
-      osc2.stop(now + 0.42);
+      osc1.stop(now + 0.28);
     }
   } catch {
-    // Autoplay restrictions or headless browser
+    // Autoplay restrictions or background tab
   }
 }
 
@@ -129,6 +115,9 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
 }) => {
   const { currentUser } = useAuth();
 
+  // Mode Selection: Live Conveyor Inspection (Default) vs Manual Test Mode
+  const [activeTab, setActiveTab] = useState<StationTab>('conveyor');
+
   // Video and Media Stream Refs
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -140,7 +129,47 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [streamInfo, setStreamInfo] = useState<{ width: number; height: number; fps: number } | null>(null);
 
-  // Optical Inspection Image & Meta state
+  // Autonomous Conveyor Belt System State
+  const [isLiveInspectionRunning, setIsLiveInspectionRunning] = useState<boolean>(false);
+  const [conveyorState, setConveyorState] = useState<ConveyorState>('IDLE');
+  const [liveInspectionFps, setLiveInspectionFps] = useState<number>(DEFAULT_LIVE_INSPECTION_FPS);
+  const [roiConfig, setRoiConfig] = useState<RoiNormalized>({ ...DEFAULT_ROI_NORMALIZED });
+  const [roiPreset, setRoiPreset] = useState<'standard' | 'compact' | 'wide'>('standard');
+
+  // Session Inspection Counters
+  const [sessionInspectedCount, setSessionInspectedCount] = useState<number>(0);
+  const [sessionPassCount, setSessionPassCount] = useState<number>(0);
+  const [sessionFailCount, setSessionFailCount] = useState<number>(0);
+
+  // Latest Live Result Banner
+  const [currentLiveResult, setCurrentLiveResult] = useState<{
+    result: QualityStatus;
+    anomalyScore: number;
+    threshold: number;
+    productIndex: number;
+    defectRegion?: DefectRegion;
+    timestamp: string;
+  } | null>(null);
+
+  // Live Performance & Bottleneck Diagnostics
+  const [liveDiagnostics, setLiveDiagnostics] = useState<LiveDiagnostics>({
+    cameraFps: 0,
+    processingFps: 0,
+    currentState: 'IDLE',
+    roiOccupancy: 0,
+    productDetectionScore: 0,
+    blurScore: 0,
+    framesSampled: 0,
+    framesInspected: 0,
+    productsDetected: 0,
+    productsInspected: 0,
+    productsSkipped: 0,
+    averageInferenceTimeMs: 0,
+    lastInferenceTimeMs: 0,
+    isBottleneck: false,
+  });
+
+  // Manual Test Mode Captured Image
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [imageMeta, setImageMeta] = useState<{
     source: 'webcam' | 'upload';
@@ -149,8 +178,8 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
     resolution?: string;
   } | null>(null);
 
-  const [captureFlash, setCaptureFlash] = useState<boolean>(false);
-  const [showReticle, setShowReticle] = useState<boolean>(true);
+  const [activeViewMode, setActiveViewMode] = useState<ViewMode>('live');
+  const [showDebugInfo, setShowDebugInfo] = useState<boolean>(false);
 
   // Normal Reference Representation state
   const [referenceImages, setReferenceImages] = useState<{ id: string; dataUrl: string; fileName: string }[]>([]);
@@ -164,11 +193,11 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
   const [analysisStep, setAnalysisStep] = useState<string>('');
   const [inspectionResult, setInspectionResult] = useState<PatchCoreInspectionResult | null>(null);
   const [lastSavedId, setLastSavedId] = useState<string | null>(null);
-  const [activeViewMode, setActiveViewMode] = useState<ViewMode>('original');
-  const [showDebugInfo, setShowDebugInfo] = useState<boolean>(false);
 
-  // Memory bank cache keyed by productId
+  // Tracker and Memory Bank Caches
+  const trackerRef = useRef<LiveConveyorTracker>(new LiveConveyorTracker(roiConfig, liveInspectionFps));
   const memoryBankCacheRef = useRef<Map<string, { bank: PatchCoreMemoryBank; count: number }>>(new Map());
+  const loopIntervalRef = useRef<number | null>(null);
 
   // 1. Load normal reference images for current product from users/{userId}/datasets
   useEffect(() => {
@@ -183,7 +212,6 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
 
     const loadProductReferences = async () => {
       try {
-        // Query users/{userId}/datasets for this product
         const items = await getUserDatasets(currentUser.uid, currentProduct.id);
         if (!isMounted) return;
 
@@ -197,7 +225,6 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
             }));
           setReferenceImages(valid);
         } else {
-          // Check local store fallback scoped to current authenticated user
           const localItems = getProductDataset(currentProduct.name, currentUser.uid);
           const valid = localItems
             .filter((it) => it.dataUrl && it.dataUrl.length > 0)
@@ -227,7 +254,6 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
 
     loadProductReferences();
 
-    // Check if memory bank is already cached
     const cached = memoryBankCacheRef.current.get(currentProduct.id);
     if (cached) {
       setMemoryBank(cached.bank);
@@ -235,7 +261,6 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
       setMemoryBank(null);
     }
 
-    // Reset previous inspection result when product changes
     setInspectionResult(null);
     setLastSavedId(null);
 
@@ -247,7 +272,7 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
   /**
    * Stop camera stream tracks and clear stream reference
    */
-  const stopCamera = () => {
+  const stopCamera = useCallback(() => {
     if (streamRef.current) {
       try {
         streamRef.current.getTracks().forEach((track) => {
@@ -266,21 +291,12 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
     setIsCameraActive(false);
     setIsRequestingCamera(false);
     setStreamInfo(null);
-  };
-
-  /**
-   * Clean up camera stream on unmount
-   */
-  useEffect(() => {
-    return () => {
-      stopCamera();
-    };
   }, []);
 
   /**
-   * Start live camera
+   * Start continuous live camera stream
    */
-  const startCamera = async () => {
+  const startCamera = useCallback(async (): Promise<boolean> => {
     setCameraError(null);
     setIsRequestingCamera(true);
 
@@ -289,24 +305,27 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
         'Browser camera unavailable: The MediaDevices API is not supported in this browser or is restricted.'
       );
       setIsRequestingCamera(false);
-      return;
+      return false;
     }
 
-    stopCamera();
+    if (streamRef.current && isCameraActive) {
+      setIsRequestingCamera(false);
+      return true;
+    }
 
     try {
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           video: {
-            width: { ideal: 1920, min: 640 },
-            height: { ideal: 1080, min: 480 },
+            width: { ideal: 1280, min: 640 },
+            height: { ideal: 720, min: 480 },
             facingMode: 'environment',
           },
           audio: false,
         });
       } catch (firstErr) {
-        console.warn('High-res camera constraints failed, attempting basic video:', firstErr);
+        console.warn('Ideal camera constraints failed, attempting fallback:', firstErr);
         stream = await navigator.mediaDevices.getUserMedia({
           video: true,
           audio: false,
@@ -339,158 +358,38 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
       setIsCameraActive(true);
       setActiveViewMode('live');
       setCameraError(null);
+      return true;
     } catch (err: any) {
       console.error('Camera access error:', err);
       setIsCameraActive(false);
 
       if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
         setCameraError(
-          'Camera permission denied: Please allow camera access in browser permissions to enable live video inspection.'
+          'Camera permission denied: Please enable camera permissions in your browser to inspect live parts.'
         );
       } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
         setCameraError(
-          'No camera detected: No video camera was found connected. You can use the "Upload Image" option.'
+          'No camera detected: Connect a USB or industrial web camera to enable optical inspection.'
+        );
+      } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+        setCameraError(
+          'Camera already in use: Another program or browser tab is accessing the camera device.'
         );
       } else {
         setCameraError(`Camera initialization error: ${err.message || 'Unable to open camera.'}`);
       }
+      return false;
     } finally {
       setIsRequestingCamera(false);
     }
-  };
+  }, [isCameraActive]);
 
   /**
-   * Capture current video frame using HTML canvas
+   * Pre-builds or retrieves the normal reference memory bank
    */
-  const handleCaptureImage = () => {
-    if (!videoRef.current || !isCameraActive) {
-      setCameraError('Cannot capture frame: Camera stream is not active. Please start camera first.');
-      return;
-    }
-
-    const video = videoRef.current;
-    const width = video.videoWidth || 1280;
-    const height = video.videoHeight || 720;
-
-    if (width === 0 || height === 0) {
-      setCameraError('Video frame is not ready yet. Please wait a moment and try again.');
-      return;
-    }
-
-    try {
-      setCaptureFlash(true);
-      setTimeout(() => setCaptureFlash(false), 200);
-
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error('Canvas context could not be created');
-
-      ctx.drawImage(video, 0, 0, width, height);
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
-
-      setCapturedImage(dataUrl);
-      const prodName = currentProduct ? currentProduct.name.replace(/\s+/g, '_') : 'Part';
-      setImageMeta({
-        source: 'webcam',
-        name: `Frame_${prodName}_${Date.now().toString().slice(-6)}.jpg`,
-        timestamp: new Date().toLocaleTimeString(),
-        resolution: `${width} × ${height} px`,
-      });
-      setInspectionResult(null);
-      setLastSavedId(null);
-      setActiveViewMode('original');
-      setCameraError(null);
-    } catch (err: any) {
-      console.error('Frame capture error:', err);
-      setCameraError(`Frame capture failed: ${err.message || 'Error grabbing video frame'}`);
-    }
-  };
-
-  /**
-   * Upload Image handler (JPG, JPEG, PNG, WebP)
-   */
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    if (!file.type.startsWith('image/')) {
-      setCameraError('Invalid file type: Please upload a JPG, JPEG, PNG, or WebP image.');
-      if (fileInputRef.current) fileInputRef.current.value = '';
-      return;
-    }
-
-    if (file.size > 20 * 1024 * 1024) {
-      setCameraError('Image file is too large: Maximum supported size is 20MB.');
-      if (fileInputRef.current) fileInputRef.current.value = '';
-      return;
-    }
-
-    setCameraError(null);
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const result = event.target?.result as string;
-      if (result) {
-        const img = new Image();
-        img.onload = () => {
-          setCapturedImage(result);
-          setImageMeta({
-            source: 'upload',
-            name: file.name,
-            timestamp: new Date().toLocaleTimeString(),
-            resolution: `${img.naturalWidth} × ${img.naturalHeight} px`,
-          });
-          setInspectionResult(null);
-          setLastSavedId(null);
-          setActiveViewMode('original');
-        };
-        img.onerror = () => {
-          setCapturedImage(result);
-          setImageMeta({
-            source: 'upload',
-            name: file.name,
-            timestamp: new Date().toLocaleTimeString(),
-          });
-          setInspectionResult(null);
-          setLastSavedId(null);
-          setActiveViewMode('original');
-        };
-        img.src = result;
-      }
-    };
-    reader.onerror = () => {
-      setCameraError('Failed to read image file. Please try another image.');
-    };
-    reader.readAsDataURL(file);
-
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
-    }
-  };
-
-  /**
-   * Clear current captured image
-   */
-  const handleClearImage = () => {
-    setCapturedImage(null);
-    setImageMeta(null);
-    setInspectionResult(null);
-    setLastSavedId(null);
-    if (isCameraActive) {
-      setActiveViewMode('live');
-    } else {
-      setActiveViewMode('original');
-    }
-  };
-
-  /**
-   * Builds the PatchCore visual manifold representation if not already cached
-   */
-  const ensureMemoryBank = async (): Promise<PatchCoreMemoryBank> => {
+  const ensureMemoryBank = useCallback(async (): Promise<PatchCoreMemoryBank> => {
     if (!currentProduct) {
-      throw new Error('Please select a product first.');
+      throw new Error('Please select a manufactured part profile first.');
     }
 
     if (referenceImages.length === 0) {
@@ -499,7 +398,6 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
       );
     }
 
-    // Check memory bank cache
     const cached = memoryBankCacheRef.current.get(currentProduct.id);
     if (cached && cached.count === referenceImages.length) {
       return cached.bank;
@@ -507,7 +405,7 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
 
     setIsTrainingMemoryBank(true);
     setTrainingProgress(10);
-    setAnalysisStep('Building normal visual representation from reference dataset...');
+    setAnalysisStep('Building normal representation from reference dataset...');
 
     try {
       const urls = referenceImages.map((r) => r.dataUrl);
@@ -525,73 +423,61 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
       setIsTrainingMemoryBank(false);
       setTrainingProgress(0);
     }
-  };
+  }, [currentProduct, referenceImages, currentUser?.uid]);
 
   /**
-   * Core AI Anomaly Detection Pipeline
-   * 1. Loads real normal reference images from users/{userId}/datasets
-   * 2. Builds/retrieves normal visual representation
-   * 3. Compares inspection image against normal reference data
-   * 4. Calculates authentic anomaly score
-   * 5. Generates anomaly localization heatmap & suspected defect region
-   * 6. Compares with product threshold (PASS/FAIL)
-   * 7. Saves completed record to users/{userId}/inspections/{inspectionId}
+   * Autonomous AI Inspection Execution:
+   * Called by the conveyor state machine when a product settles in the Inspection Zone
    */
-  const handleRunAiInspection = async () => {
-    if (!capturedImage) {
-      setCameraError('No image available to inspect. Please capture a video frame or upload an image first.');
+  const handleAutoInspect = useCallback(async (frameDataUrl: string) => {
+    if (!currentProduct || !currentUser) {
+      trackerRef.current.recordInferenceSkipped('No product or operator profile');
       return;
     }
 
-    if (!currentProduct) {
-      setCameraError('No product selected. Please select a manufactured part profile.');
-      return;
-    }
-
-    if (referenceImages.length === 0) {
-      setCameraError(
-        `No normal reference images found for "${currentProduct.name}" in users/${currentUser?.uid}/datasets. VisionQC requires normal reference samples to establish baseline tolerances. Please upload normal images in the Dataset tab first.`
-      );
-      return;
-    }
-
+    const effectiveThreshold = currentProduct.nominalThreshold ?? threshold ?? 0.50;
     setIsAnalyzing(true);
-    setCameraError(null);
+    setAnalysisStep('Analyzing candidate frame...');
 
     try {
-      // Step 1: Ensure visual manifold representation
-      setAnalysisStep('Extracting spatial patch descriptors from normal reference images...');
       const bank = await ensureMemoryBank();
+      const result = await inspectImageWithPatchCore(frameDataUrl, bank, effectiveThreshold);
 
-      // Step 2: Compare against normal reference representation
-      setAnalysisStep('Computing nearest-neighbor Euclidean distances across 28×21 spatial grid (588 patches)...');
-      // Give UI 50ms to render the step status smoothly
-      await new Promise((r) => setTimeout(r, 60));
-
-      const effectiveThreshold = currentProduct.nominalThreshold ?? threshold ?? 0.50;
-      const result = await inspectImageWithPatchCore(capturedImage, bank, effectiveThreshold);
-
-      // Step 3: Heatmap localization and decision
-      setAnalysisStep('Localizing defect coordinates and generating blended overlay...');
-      setInspectionResult(result);
-      setActiveViewMode('overlay');
-
-      // Audible alert feedback
-      if (audibleAlerts) {
-        playIndustrialAlert(result.result === 'PASS');
+      if (result.result === 'INVALID') {
+        trackerRef.current.recordInferenceSkipped(result.qualityIssue || 'Image quality below tolerance');
+        return;
       }
 
-      // Step 4: Save completed inspection to users/{userId}/inspections/{inspectionId}
-      const recordId = `QC-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.floor(1000 + Math.random() * 9000)}`;
+      // Record completed inspection
+      setSessionInspectedCount((prev) => prev + 1);
+      if (result.result === 'PASS') {
+        setSessionPassCount((prev) => prev + 1);
+        if (audibleAlerts) playIndustrialAlert(true);
+      } else {
+        setSessionFailCount((prev) => prev + 1);
+        if (audibleAlerts) playIndustrialAlert(false);
+      }
 
-      // Compress storage copy to ensure safe Firestore document sizing (<1MB)
-      const compressedInspectionImage = await compressImageForStorage(capturedImage, 800, 0.82);
+      setInspectionResult(result);
+      const nextIndex = sessionInspectedCount + 1;
+      setCurrentLiveResult({
+        result: result.result,
+        anomalyScore: result.anomalyScore,
+        threshold: effectiveThreshold,
+        productIndex: nextIndex,
+        defectRegion: result.suspectedDefectRegion,
+        timestamp: new Date().toLocaleTimeString(),
+      });
+
+      // Persist exactly ONE record to Firestore
+      const recordId = `QC-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.floor(1000 + Math.random() * 9000)}`;
+      const compressedInspectionImage = await compressImageForStorage(frameDataUrl, 800, 0.82);
       const compressedOverlay = await compressImageForStorage(result.overlayDataUrl, 800, 0.82);
       const compressedHeatmap = await compressImageForStorage(result.heatmapDataUrl, 400, 0.80);
 
       const inspectionRecord: InspectionRecord = {
         id: recordId,
-        userId: currentUser?.uid,
+        userId: currentUser.uid,
         productId: currentProduct.id,
         partId: currentProduct.id,
         productName: currentProduct.name,
@@ -606,7 +492,7 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
         confidenceScore: Number((1 - result.anomalyScore).toFixed(2)),
         imageUrl: compressedInspectionImage,
         imageDataUrl: compressedInspectionImage,
-        image_path: imageMeta?.name || `Optical_Capture_${currentProduct.sku}.jpg`,
+        image_path: `Conveyor_Frame_${currentProduct.sku}_#${nextIndex}.jpg`,
         heatmapUrl: compressedHeatmap,
         overlayUrl: compressedOverlay,
         suspectedDefectRegion: result.suspectedDefectRegion,
@@ -616,23 +502,219 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
         defectType: result.result === 'FAIL' ? 'Surface Anomaly' : 'Conformant',
         inferenceTimeMs: result.inferenceTimeMs,
         batchNumber: `BATCH-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`,
-        operator: currentUser?.displayName || 'Operator',
+        operator: currentUser.displayName || 'Operator',
         inspectionLine: currentProduct.activeLine || 'Line 01 - Optical Bench',
+        source: 'live_camera',
       };
 
       onRecordInspection(inspectionRecord);
       setLastSavedId(recordId);
+
+      // Notify tracker that inference finished so it transitions to WAIT_FOR_PRODUCT_EXIT
+      trackerRef.current.recordInferenceComplete(result.inferenceTimeMs);
     } catch (err: any) {
-      console.error('AI inspection error:', err);
-      setCameraError(err.message || 'Anomaly detection failed. Check image format and normal references.');
+      console.error('[LiveConveyor] Inspection failure:', err);
+      trackerRef.current.recordInferenceSkipped(err.message || 'Inspection error');
+    } finally {
+      setIsAnalyzing(false);
+      setAnalysisStep('');
+    }
+  }, [currentProduct, currentUser, threshold, audibleAlerts, ensureMemoryBank, onRecordInspection, sessionInspectedCount]);
+
+  /**
+   * Start Autonomous Live Inspection Loop
+   */
+  const handleStartLiveInspection = async () => {
+    if (!currentProduct) {
+      setCameraError('Please select a product part profile first.');
+      return;
+    }
+
+    if (referenceImages.length === 0) {
+      setCameraError(
+        `Cannot start live inspection: No normal reference images uploaded for "${currentProduct.name}". Please add normal images in the Dataset tab first.`
+      );
+      return;
+    }
+
+    const cameraStarted = await startCamera();
+    if (!cameraStarted) return;
+
+    // Connect tracker inspection callback
+    trackerRef.current.setInspectionHandler(handleAutoInspect);
+    trackerRef.current.setRoi(roiConfig);
+    trackerRef.current.setFps(liveInspectionFps);
+    setIsLiveInspectionRunning(true);
+    setCameraError(null);
+
+    // Frame sampling loop at LIVE_INSPECTION_FPS
+    if (loopIntervalRef.current) clearInterval(loopIntervalRef.current);
+
+    loopIntervalRef.current = window.setInterval(async () => {
+      if (!videoRef.current || videoRef.current.readyState < 2) return;
+
+      trackerRef.current.markCameraFrame();
+      const tickResult = await trackerRef.current.processFrameTick(videoRef.current);
+
+      setConveyorState(tickResult.state);
+      setLiveDiagnostics(tickResult.diagnostics);
+    }, Math.round(1000 / liveInspectionFps));
+  };
+
+  /**
+   * Stop Live Inspection Loop
+   */
+  const handleStopLiveInspection = () => {
+    if (loopIntervalRef.current) {
+      clearInterval(loopIntervalRef.current);
+      loopIntervalRef.current = null;
+    }
+
+    trackerRef.current.cleanup();
+    setIsLiveInspectionRunning(false);
+    setConveyorState('IDLE');
+    setAnalysisStep('');
+  };
+
+  /**
+   * Change ROI Preset (Standard, Compact, Wide)
+   */
+  const handleSetRoiPreset = (preset: 'standard' | 'compact' | 'wide') => {
+    setRoiPreset(preset);
+    let newRoi: RoiNormalized;
+    if (preset === 'compact') {
+      newRoi = { x: 0.25, y: 0.25, width: 0.50, height: 0.50 };
+    } else if (preset === 'wide') {
+      newRoi = { x: 0.08, y: 0.08, width: 0.84, height: 0.84 };
+    } else {
+      newRoi = { ...DEFAULT_ROI_NORMALIZED };
+    }
+    setRoiConfig(newRoi);
+    trackerRef.current.setRoi(newRoi);
+  };
+
+  /**
+   * Change Sampling FPS
+   */
+  const handleChangeFps = (fps: number) => {
+    setLiveInspectionFps(fps);
+    trackerRef.current.setFps(fps);
+    if (isLiveInspectionRunning) {
+      // Re-arm interval with new FPS
+      if (loopIntervalRef.current) clearInterval(loopIntervalRef.current);
+      loopIntervalRef.current = window.setInterval(async () => {
+        if (!videoRef.current || videoRef.current.readyState < 2) return;
+        trackerRef.current.markCameraFrame();
+        const tickResult = await trackerRef.current.processFrameTick(videoRef.current);
+        setConveyorState(tickResult.state);
+        setLiveDiagnostics(tickResult.diagnostics);
+      }, Math.round(1000 / fps));
+    }
+  };
+
+  /**
+   * Cleanup on unmount
+   */
+  useEffect(() => {
+    return () => {
+      if (loopIntervalRef.current) {
+        clearInterval(loopIntervalRef.current);
+      }
+      stopCamera();
+    };
+  }, [stopCamera]);
+
+  /**
+   * Manual Test Mode Image Upload
+   */
+  const handleManualFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const result = event.target?.result as string;
+      if (result) {
+        setCapturedImage(result);
+        setImageMeta({
+          source: 'upload',
+          name: file.name,
+          timestamp: new Date().toLocaleTimeString(),
+        });
+        setInspectionResult(null);
+        setActiveViewMode('original');
+      }
+    };
+    reader.readAsDataURL(file);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  /**
+   * Manual Test Mode Inspection Run
+   */
+  const handleRunManualInspection = async () => {
+    if (!capturedImage) {
+      setCameraError('Please upload an image first.');
+      return;
+    }
+    if (!currentProduct) {
+      setCameraError('Please select a product first.');
+      return;
+    }
+    const effectiveThreshold = currentProduct.nominalThreshold ?? threshold ?? 0.50;
+    setIsAnalyzing(true);
+    setAnalysisStep('Analyzing test frame...');
+
+    try {
+      const bank = await ensureMemoryBank();
+      const result = await inspectImageWithPatchCore(capturedImage, bank, effectiveThreshold);
+      setInspectionResult(result);
+      setActiveViewMode('overlay');
+
+      if (audibleAlerts && result.result !== 'INVALID') {
+        playIndustrialAlert(result.result === 'PASS');
+      }
+
+      if (result.result !== 'INVALID') {
+        const recordId = `QC-MANUAL-${Date.now().toString().slice(-6)}`;
+        onRecordInspection({
+          id: recordId,
+          userId: currentUser?.uid,
+          productId: currentProduct.id,
+          partId: currentProduct.id,
+          productName: currentProduct.name,
+          product_name: currentProduct.name,
+          partSku: currentProduct.sku,
+          timestamp: new Date().toISOString().replace('T', ' ').slice(0, 19),
+          anomalyScore: result.anomalyScore,
+          anomaly_score: result.anomalyScore,
+          threshold: effectiveThreshold,
+          status: result.result,
+          result: result.result,
+          confidenceScore: Number((1 - result.anomalyScore).toFixed(2)),
+          imageUrl: capturedImage,
+          imageDataUrl: capturedImage,
+          image_path: imageMeta?.name || 'Manual_Test_Image.jpg',
+          heatmapUrl: result.heatmapDataUrl,
+          overlayUrl: result.overlayDataUrl,
+          suspectedDefectRegion: result.suspectedDefectRegion,
+          defectLocation: result.result === 'FAIL' ? `(${result.maxAnomalyCoord.x}px, ${result.maxAnomalyCoord.y}px)` : '',
+          defectType: result.result === 'FAIL' ? 'Surface Anomaly' : 'Conformant',
+          inferenceTimeMs: result.inferenceTimeMs,
+          source: 'manual_upload',
+        });
+        setLastSavedId(recordId);
+      }
+    } catch (err: any) {
+      setCameraError(err.message || 'Inspection failed');
     } finally {
       setIsAnalyzing(false);
       setAnalysisStep('');
     }
   };
 
-  const isPass = inspectionResult?.result === 'PASS';
   const effectiveThreshold = currentProduct?.nominalThreshold ?? threshold ?? 0.50;
+  const yieldPct = sessionInspectedCount > 0 ? ((sessionPassCount / sessionInspectedCount) * 100).toFixed(1) : '100.0';
 
   return (
     <div className="space-y-6">
@@ -643,25 +725,25 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
           <div className="flex items-center gap-2 text-xs font-mono text-slate-500 mb-1">
             <span className="flex items-center gap-1.5 text-blue-600 font-semibold">
               <span className="w-2 h-2 rounded-full bg-blue-600" />
-              OPTICAL ACQUISITION STATION
+              CONTINUOUS INDUSTRIAL OPTICAL STATION
             </span>
             <span>·</span>
-            <span>CELL QC-01</span>
+            <span>LINE CONVEYOR-01</span>
             <span>·</span>
-            <span className="text-slate-400">PatchCore Engine (CVPR 2022)</span>
+            <span className="text-slate-400">Autonomous Edge AI</span>
           </div>
           <h2 className="text-lg font-bold text-slate-900 tracking-tight font-mono">
-            Live Visual Inspection Chamber
+            Live Conveyor-Belt Optical Chamber
           </h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            Real computer-vision anomaly detection comparing optical frames against authenticated reference datasets.
+            Continuous optical stream monitoring with automated product presence detection and zero-click defect localization.
           </p>
         </div>
 
         {/* Product Part Dropdown Selector */}
         <div className="flex items-center gap-3">
           <label className="text-xs font-mono font-medium text-slate-600 whitespace-nowrap">
-            Inspection Target:
+            Inspection Part:
           </label>
           {products.length === 0 ? (
             <div className="flex items-center gap-2">
@@ -672,7 +754,7 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
                   onClick={onCreateProduct}
                   className="px-2.5 py-1 text-xs font-mono font-medium text-blue-600 bg-blue-50 hover:bg-blue-100 rounded border border-blue-200 transition-colors"
                 >
-                  + Register Product
+                  + Register Part
                 </button>
               )}
             </div>
@@ -683,7 +765,7 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
                 const selected = products.find((p) => p.id === e.target.value);
                 if (selected) onSelectProduct(selected);
               }}
-              className="bg-slate-50 border border-slate-300 text-slate-800 text-xs font-mono px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent font-medium"
+              className="bg-slate-50 border border-slate-300 text-slate-800 text-xs font-mono px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent font-medium cursor-pointer"
             >
               {products.map((p) => (
                 <option key={p.id} value={p.id}>
@@ -695,51 +777,45 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
         </div>
       </div>
 
-      {/* Reference Model Status Notice */}
-      {currentProduct && (
-        <div className="p-3.5 bg-white border border-slate-200 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs font-mono shadow-xs">
-          <div className="flex items-center gap-2.5">
-            {isLoadingReferences ? (
-              <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />
-            ) : referenceImages.length > 0 ? (
-              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-            ) : (
-              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+      {/* Mode Tabs: LIVE CONVEYOR (Default) vs MANUAL TEST MODE */}
+      <div className="flex items-center justify-between border-b border-slate-200 pb-2">
+        <div className="flex items-center gap-2 font-mono text-xs">
+          <button
+            type="button"
+            onClick={() => setActiveTab('conveyor')}
+            className={`px-4 py-2 rounded-lg font-bold flex items-center gap-2 transition-all cursor-pointer ${
+              activeTab === 'conveyor'
+                ? 'bg-blue-600 text-white shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+            }`}
+          >
+            <Video className="w-4 h-4" />
+            <span>LIVE CONVEYOR INSPECTION</span>
+            {isLiveInspectionRunning && (
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse ml-1" />
             )}
+          </button>
 
-            <div>
-              <span className="font-bold text-slate-900">
-                {referenceImages.length > 0 ? (
-                  <>Normal Representation: <span className="text-emerald-700">{referenceImages.length} samples</span> loaded from Firestore</>
-                ) : (
-                  <>Normal Representation: <span className="text-amber-700">0 samples</span> in users/{currentUser?.uid}/datasets</>
-                )}
-              </span>
-              <span className="text-slate-400 ml-2 hidden md:inline">
-                {referenceImages.length > 0
-                  ? 'Spatial grid: 28×21 (588 patches) · Coreset memory bank ready'
-                  : 'Add normal reference images to initialize tolerance manifold'}
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2">
-            {referenceImages.length === 0 && onNavigate && (
-              <button
-                type="button"
-                onClick={() => onNavigate('dataset')}
-                className="px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded-md font-bold text-xs flex items-center gap-1.5 transition-colors"
-              >
-                <span>Add Reference Images</span>
-                <ArrowRight className="w-3 h-3" />
-              </button>
-            )}
-            <span className="text-[11px] text-slate-400 bg-slate-100 px-2 py-1 rounded">
-              Tolerance: {effectiveThreshold.toFixed(2)}
-            </span>
-          </div>
+          <button
+            type="button"
+            onClick={() => setActiveTab('manual')}
+            className={`px-4 py-2 rounded-lg font-semibold flex items-center gap-2 transition-all cursor-pointer ${
+              activeTab === 'manual'
+                ? 'bg-slate-900 text-white shadow-xs'
+                : 'text-slate-500 hover:text-slate-900 hover:bg-slate-100'
+            }`}
+          >
+            <Upload className="w-4 h-4" />
+            <span>MANUAL TEST MODE (OFFLINE / DEBUG)</span>
+          </button>
         </div>
-      )}
+
+        <div className="hidden sm:flex items-center gap-3 text-xs font-mono text-slate-500">
+          <span>Tolerance: <strong className="text-slate-800">{effectiveThreshold.toFixed(2)}</strong></span>
+          <span>·</span>
+          <span>References: <strong className="text-slate-800">{referenceImages.length}</strong></span>
+        </div>
+      </div>
 
       {/* Camera & Permission Error Alert Banner */}
       {cameraError && (
@@ -747,13 +823,13 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
           <div className="flex items-start gap-2.5">
             <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
             <div>
-              <div className="font-bold text-rose-900 mb-0.5">Optical System Alert</div>
+              <div className="font-bold text-rose-900 mb-0.5">Optical Sensor Warning</div>
               <div className="leading-relaxed">{cameraError}</div>
             </div>
           </div>
           <button
             onClick={() => setCameraError(null)}
-            className="text-rose-500 hover:text-rose-800 text-xs font-bold px-2 py-1 rounded hover:bg-rose-100 transition-colors"
+            className="text-rose-500 hover:text-rose-800 text-xs font-bold px-2 py-1 rounded hover:bg-rose-100 transition-colors cursor-pointer"
           >
             Dismiss
           </button>
@@ -763,72 +839,42 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
       {/* Main Two-Column Layout */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         
-        {/* Left Column (8 cols): Large Live Camera / Inspection Viewport Area */}
+        {/* Left Column (8 cols): Large Continuous Live Camera Viewport Area */}
         <div className="lg:col-span-8 space-y-4">
           
           <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-xs">
             
-            {/* Viewport Header with View Mode Switcher */}
+            {/* Viewport Header with Live Status & Mode Badge */}
             <div className="px-4 py-3 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
               <div className="flex items-center gap-2">
-                <div className={`w-2.5 h-2.5 rounded-full ${isAnalyzing ? 'bg-amber-400 animate-ping' : 'bg-blue-500'}`} />
+                <div className={`w-2.5 h-2.5 rounded-full ${
+                  isLiveInspectionRunning ? 'bg-emerald-400 animate-ping' : isCameraActive ? 'bg-blue-400' : 'bg-slate-500'
+                }`} />
                 <span className="font-bold text-white tracking-wide">
-                  OPTICAL SENSOR VIEWPORT
+                  {activeTab === 'conveyor' ? 'CONVEYOR OPTICAL FEED' : 'MANUAL TEST FEED'}
                 </span>
 
-                {isCameraActive && (
+                {isLiveInspectionRunning && (
                   <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 text-[10px] font-bold border border-emerald-500/30 flex items-center gap-1.5 ml-1">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                    LIVE FEED
-                  </span>
-                )}
-
-                {inspectionResult && (
-                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ml-1 ${
-                    isPass 
-                      ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30' 
-                      : 'bg-rose-500/20 text-rose-400 border-rose-500/30'
-                  }`}>
-                    {inspectionResult.result} ({inspectionResult.anomalyScore.toFixed(2)})
+                    AUTONOMOUS INSPECTION ACTIVE
                   </span>
                 )}
               </div>
 
-              {/* View Mode Tabs (When an image or inspection result exists) */}
+              {/* View Mode Tabs for Manual Mode or Result Overlays */}
               <div className="flex items-center gap-1 bg-slate-800/80 p-0.5 rounded-lg border border-slate-700 text-[10px]">
-                {isCameraActive && (
-                  <button
-                    type="button"
-                    onClick={() => setActiveViewMode('live')}
-                    className={`px-2.5 py-1 rounded transition-colors ${
-                      activeViewMode === 'live' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    Live Video
-                  </button>
-                )}
-                {capturedImage && (
-                  <button
-                    type="button"
-                    onClick={() => setActiveViewMode('original')}
-                    className={`px-2.5 py-1 rounded transition-colors ${
-                      activeViewMode === 'original' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    Raw Frame
-                  </button>
-                )}
+                <button
+                  type="button"
+                  onClick={() => setActiveViewMode('live')}
+                  className={`px-2.5 py-1 rounded transition-colors ${
+                    activeViewMode === 'live' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Live Feed
+                </button>
                 {inspectionResult && (
                   <>
-                    <button
-                      type="button"
-                      onClick={() => setActiveViewMode('heatmap')}
-                      className={`px-2.5 py-1 rounded transition-colors ${
-                        activeViewMode === 'heatmap' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      Heatmap
-                    </button>
                     <button
                       type="button"
                       onClick={() => setActiveViewMode('overlay')}
@@ -838,6 +884,15 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
                     >
                       Overlay + Defect
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveViewMode('heatmap')}
+                      className={`px-2.5 py-1 rounded transition-colors ${
+                        activeViewMode === 'heatmap' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Heatmap
+                    </button>
                   </>
                 )}
               </div>
@@ -846,12 +901,7 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
             {/* Viewport Display Chamber */}
             <div className="relative aspect-video w-full bg-slate-950 flex items-center justify-center overflow-hidden select-none">
               
-              {/* Shutter flash animation on capture */}
-              {captureFlash && (
-                <div className="absolute inset-0 bg-white z-30 transition-opacity duration-200 opacity-90 pointer-events-none" />
-              )}
-
-              {/* View 1: Live Webcam Video Element */}
+              {/* Continuous Video Feed */}
               <video
                 ref={videoRef}
                 autoPlay
@@ -862,17 +912,16 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
                 }`}
               />
 
-              {/* View 2: Raw Captured/Uploaded Image */}
-              {capturedImage && activeViewMode === 'original' && (
+              {/* Image Overlays (When inspecting or reviewing results) */}
+              {activeViewMode === 'overlay' && inspectionResult && (
                 <img
-                  src={capturedImage}
-                  alt="Captured Target"
+                  src={inspectionResult.overlayDataUrl}
+                  alt="Inspection Overlay"
                   className="w-full h-full object-contain"
                 />
               )}
 
-              {/* View 3: Anomaly Heatmap (Jet Colormap) */}
-              {inspectionResult && activeViewMode === 'heatmap' && (
+              {activeViewMode === 'heatmap' && inspectionResult && (
                 <img
                   src={inspectionResult.heatmapDataUrl}
                   alt="Anomaly Heatmap"
@@ -880,33 +929,15 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
                 />
               )}
 
-              {/* View 4: Blended Overlay with Defect Crosshair & Bounding Box */}
-              {inspectionResult && activeViewMode === 'overlay' && (
+              {activeViewMode === 'original' && capturedImage && (
                 <img
-                  src={inspectionResult.overlayDataUrl}
-                  alt="Blended Anomaly Overlay"
+                  src={capturedImage}
+                  alt="Captured Frame"
                   className="w-full h-full object-contain"
                 />
               )}
 
-              {/* Viewport Overlay: Analyzing Spinner */}
-              {isAnalyzing && (
-                <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-xs z-20 flex flex-col items-center justify-center p-6 text-center text-white space-y-3 animate-fadeIn">
-                  <div className="w-12 h-12 rounded-full border-3 border-blue-500/30 border-t-blue-500 animate-spin flex items-center justify-center">
-                    <Activity className="w-5 h-5 text-blue-400" />
-                  </div>
-                  <div className="space-y-1">
-                    <div className="text-sm font-bold font-mono text-white">
-                      Evaluating Optical Manifold Distance
-                    </div>
-                    <div className="text-xs font-mono text-blue-300 max-w-sm">
-                      {analysisStep || 'Comparing spatial patch features against normal memory bank...'}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* Camera Inactive & No Image Placeholder */}
+              {/* Camera Standby Indicator */}
               {!isCameraActive && !capturedImage && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center text-slate-400 space-y-3">
                   <div className="w-16 h-16 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-slate-500 shadow-inner">
@@ -914,131 +945,270 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
                   </div>
                   <div>
                     <div className="text-sm font-bold font-mono text-slate-200">
-                      Optical Sensor Standby
+                      Conveyor Optical Chamber Standby
                     </div>
-                    <p className="text-xs text-slate-500 max-w-sm mt-1">
-                      Start the camera to capture a manufactured part, or upload an image to run the AI anomaly detection pipeline.
+                    <p className="text-xs text-slate-500 max-w-sm mt-1 font-mono">
+                      Click &quot;Start Live Inspection&quot; to begin continuous automated conveyor tracking.
                     </p>
                   </div>
                 </div>
               )}
 
-              {/* Inspection Reticle & Crosshair Overlay (Only in live video or raw frame) */}
-              {showReticle && (activeViewMode === 'live' || (activeViewMode === 'original' && !inspectionResult)) && (
-                <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
-                  <div className="w-3/4 h-3/4 border border-dashed border-blue-500/30 rounded-lg relative">
-                    <div className="absolute -top-0.5 -left-0.5 w-4 h-4 border-t-2 border-l-2 border-blue-400" />
-                    <div className="absolute -top-0.5 -right-0.5 w-4 h-4 border-t-2 border-r-2 border-blue-400" />
-                    <div className="absolute -bottom-0.5 -left-0.5 w-4 h-4 border-b-2 border-l-2 border-blue-400" />
-                    <div className="absolute -bottom-0.5 -right-0.5 w-4 h-4 border-b-2 border-r-2 border-blue-400" />
-                    
-                    <div className="absolute inset-0 flex items-center justify-center opacity-40">
-                      <div className="w-6 h-0.5 bg-blue-400" />
-                      <div className="h-6 w-0.5 bg-blue-400 -ml-3.25" />
+              {/* CONVEYOR INSPECTION ZONE RETICLE (Active in Live Feed) */}
+              {isCameraActive && activeViewMode === 'live' && (
+                <div
+                  className="absolute pointer-events-none transition-all duration-300"
+                  style={{
+                    left: `${roiConfig.x * 100}%`,
+                    top: `${roiConfig.y * 100}%`,
+                    width: `${roiConfig.width * 100}%`,
+                    height: `${roiConfig.height * 100}%`,
+                  }}
+                >
+                  {/* Dynamic Reticle Border depending on State */}
+                  <div className={`w-full h-full rounded-lg relative transition-all duration-200 border-2 ${
+                    conveyorState === 'IDLE'
+                      ? 'border-dashed border-blue-400/40'
+                      : conveyorState === 'PRODUCT_DETECTED' || conveyorState === 'ENTERING'
+                      ? 'border-amber-400 animate-pulse shadow-[0_0_15px_rgba(251,191,36,0.3)]'
+                      : conveyorState === 'READY_FOR_INSPECTION' || conveyorState === 'INSPECTING'
+                      ? 'border-cyan-400 animate-pulse shadow-[0_0_20px_rgba(34,211,238,0.4)]'
+                      : currentLiveResult?.result === 'FAIL'
+                      ? 'border-rose-500 shadow-[0_0_25px_rgba(244,63,94,0.5)]'
+                      : 'border-emerald-400 shadow-[0_0_20px_rgba(52,211,153,0.4)]'
+                  }`}>
+                    {/* Industrial Corner Accents */}
+                    <div className="absolute -top-1 -left-1 w-5 h-5 border-t-4 border-l-4 border-inherit" />
+                    <div className="absolute -top-1 -right-1 w-5 h-5 border-t-4 border-r-4 border-inherit" />
+                    <div className="absolute -bottom-1 -left-1 w-5 h-5 border-b-4 border-l-4 border-inherit" />
+                    <div className="absolute -bottom-1 -right-1 w-5 h-5 border-b-4 border-r-4 border-inherit" />
+
+                    {/* Center Crosshair */}
+                    <div className="absolute inset-0 flex items-center justify-center opacity-30">
+                      <div className="w-8 h-0.5 bg-white" />
+                      <div className="h-8 w-0.5 bg-white -ml-4" />
+                    </div>
+
+                    {/* Inspection Zone Label */}
+                    <div className="absolute -top-6 left-1 bg-slate-900/80 px-2 py-0.5 rounded text-[10px] font-mono text-blue-300 font-bold tracking-wider backdrop-blur-xs flex items-center gap-1.5">
+                      <Box className="w-3 h-3 text-blue-400" />
+                      <span>INSPECTION ZONE</span>
+                    </div>
+
+                    {/* Occupancy Indicator in Corner */}
+                    <div className="absolute bottom-2 right-2 bg-slate-950/80 px-2 py-0.5 rounded text-[10px] font-mono text-slate-300 font-semibold backdrop-blur-xs">
+                      Occupancy: {liveDiagnostics.roiOccupancy}%
                     </div>
                   </div>
+                </div>
+              )}
 
-                  <div className="absolute bottom-3 left-4 text-[10px] font-mono text-slate-400/80 bg-slate-900/70 px-2 py-0.5 rounded backdrop-blur-xs">
-                    PART: {currentProduct ? currentProduct.name : 'NO PRODUCT SELECTED'}
+              {/* LIVE CONVEYOR FLOATING HUD (Top Left & Top Right) */}
+              {isCameraActive && activeViewMode === 'live' && (
+                <>
+                  <div className="absolute top-3 left-3 flex flex-col gap-1 font-mono text-[10px] pointer-events-none">
+                    <span className="px-2.5 py-1 rounded bg-slate-900/80 text-white backdrop-blur-xs flex items-center gap-1.5 border border-slate-700/60 shadow-sm">
+                      <span className={`w-2 h-2 rounded-full ${
+                        conveyorState === 'IDLE' ? 'bg-slate-400' : 'bg-emerald-400 animate-ping'
+                      }`} />
+                      <span>STATE: <strong>{conveyorState}</strong></span>
+                    </span>
                   </div>
+
+                  <div className="absolute top-3 right-3 flex items-center gap-2 font-mono text-[10px] pointer-events-none">
+                    <span className="px-2 py-1 rounded bg-slate-900/80 text-slate-300 backdrop-blur-xs border border-slate-700/60">
+                      Cam: <strong className="text-white">{liveDiagnostics.cameraFps} FPS</strong>
+                    </span>
+                    <span className="px-2 py-1 rounded bg-slate-900/80 text-slate-300 backdrop-blur-xs border border-slate-700/60">
+                      Proc: <strong className="text-white">{liveDiagnostics.processingFps} FPS</strong>
+                    </span>
+                    {liveDiagnostics.isBottleneck && (
+                      <span className="px-2 py-1 rounded bg-rose-600/90 text-white font-bold animate-pulse backdrop-blur-xs border border-rose-400">
+                        PROCESSING BOTTLENECK
+                      </span>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {/* REAL-TIME PRODUCT RESULT CARD OVERLAY (Floats in Viewport) */}
+              {isCameraActive && activeViewMode === 'live' && (
+                <div className="absolute bottom-3 left-3 right-3 pointer-events-none flex justify-center">
+                  {isAnalyzing ? (
+                    <div className="bg-slate-900/90 border border-cyan-500/50 rounded-xl px-5 py-3 text-white font-mono text-xs shadow-2xl backdrop-blur-md flex items-center gap-3 animate-pulse">
+                      <Loader2 className="w-5 h-5 text-cyan-400 animate-spin" />
+                      <div>
+                        <div className="font-bold text-cyan-300">CURRENT PRODUCT: Inspecting...</div>
+                        <div className="text-[11px] text-slate-400">Comparing multi-scale patch vectors against normal baseline...</div>
+                      </div>
+                    </div>
+                  ) : currentLiveResult ? (
+                    <div className={`rounded-xl px-5 py-3 font-mono text-xs shadow-2xl backdrop-blur-md flex items-center justify-between gap-6 border-2 transition-all ${
+                      currentLiveResult.result === 'PASS'
+                        ? 'bg-slate-950/90 border-emerald-500 text-white'
+                        : 'bg-slate-950/90 border-rose-500 text-white'
+                    }`}>
+                      <div className="flex items-center gap-3">
+                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                          currentLiveResult.result === 'PASS' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
+                        }`}>
+                          {currentLiveResult.result === 'PASS' ? (
+                            <CheckCircle2 className="w-6 h-6" />
+                          ) : (
+                            <XCircle className="w-6 h-6" />
+                          )}
+                        </div>
+                        <div>
+                          <div className="text-sm font-bold flex items-center gap-2">
+                            <span>{currentLiveResult.result === 'PASS' ? 'PASS ✓' : 'FAIL ⚠'}</span>
+                            <span className="text-[11px] font-normal text-slate-400">Product #{currentLiveResult.productIndex}</span>
+                          </div>
+                          <div className="text-[11px] text-slate-300">
+                            Score: <strong>{currentLiveResult.anomalyScore.toFixed(2)}</strong> (Limit: {currentLiveResult.threshold.toFixed(2)})
+                            {currentLiveResult.defectRegion && (
+                              <span className="text-rose-400 ml-2">· Defect Detected ({currentLiveResult.defectRegion.confidence}%)</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="text-right text-[10px] text-slate-400">
+                        <div>Logged to Firestore</div>
+                        <div>{currentLiveResult.timestamp}</div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="bg-slate-900/70 border border-slate-700/50 rounded-lg px-4 py-1.5 text-slate-400 font-mono text-[11px] backdrop-blur-xs">
+                      {isLiveInspectionRunning ? 'Watching conveyor: Awaiting manufactured part in Inspection Zone...' : 'Station idle'}
+                    </div>
+                  )}
                 </div>
               )}
 
             </div>
 
-            {/* Action Bar: Camera / Capture / Upload / RUN AI INSPECTION */}
+            {/* ACTION BAR: PRIMARY CONVEYOR CONTROLS */}
             <div className="p-4 bg-white border-t border-slate-200 flex flex-wrap items-center justify-between gap-3">
               
-              {/* Left Group: Live Camera & Frame Grab */}
-              <div className="flex flex-wrap items-center gap-2.5">
-                {!isCameraActive ? (
-                  <button
-                    type="button"
-                    onClick={startCamera}
-                    disabled={isRequestingCamera}
-                    className="flex items-center gap-2 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white text-xs font-mono font-bold rounded-lg transition-colors shadow-xs cursor-pointer disabled:opacity-50"
-                  >
-                    <Video className="w-4 h-4" />
-                    <span>{isRequestingCamera ? 'Requesting Camera...' : 'Start Camera'}</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={stopCamera}
-                    className="flex items-center gap-2 px-4 py-2.5 bg-slate-800 hover:bg-slate-900 text-white text-xs font-mono font-bold rounded-lg transition-colors shadow-xs cursor-pointer"
-                  >
-                    <VideoOff className="w-4 h-4" />
-                    <span>Stop Camera</span>
-                  </button>
-                )}
-
-                {/* Capture Image Button */}
-                <button
-                  type="button"
-                  onClick={handleCaptureImage}
-                  disabled={!isCameraActive}
-                  className="flex items-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white text-xs font-mono font-bold rounded-lg transition-colors shadow-xs cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  <Camera className="w-4 h-4" />
-                  <span>Capture Image</span>
-                </button>
-              </div>
-
-              {/* Middle / Right Group: Upload Image & Primary AI Action */}
-              <div className="flex flex-wrap items-center gap-2.5">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".jpg,.jpeg,.png,image/jpeg,image/png,image/webp"
-                  onChange={handleFileUpload}
-                  className="hidden"
-                />
-
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="flex items-center gap-2 px-3.5 py-2.5 bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-700 text-xs font-mono font-semibold rounded-lg transition-colors border border-slate-300 cursor-pointer"
-                >
-                  <Upload className="w-4 h-4 text-slate-500" />
-                  <span>Upload Image</span>
-                </button>
-
-                {capturedImage && (
-                  <button
-                    type="button"
-                    onClick={handleClearImage}
-                    title="Discard current image"
-                    className="p-2.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors border border-transparent hover:border-rose-200 cursor-pointer"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                )}
-
-                {/* CORE AI ANOMALY DETECTION EXECUTE BUTTON */}
-                <button
-                  type="button"
-                  onClick={handleRunAiInspection}
-                  disabled={!capturedImage || isAnalyzing || referenceImages.length === 0}
-                  className={`flex items-center gap-2 px-5 py-2.5 text-xs font-mono font-bold rounded-lg transition-all shadow-md cursor-pointer ${
-                    !capturedImage || referenceImages.length === 0
-                      ? 'bg-slate-200 text-slate-400 cursor-not-allowed shadow-none'
-                      : isAnalyzing
-                      ? 'bg-amber-600 text-white cursor-wait'
-                      : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white hover:shadow-lg hover:shadow-blue-500/25 active:scale-98'
-                  }`}
-                >
-                  {isAnalyzing ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin text-white" />
-                      <span>Analyzing Anomaly...</span>
-                    </>
+              {/* Left Group: START / STOP LIVE INSPECTION */}
+              {activeTab === 'conveyor' ? (
+                <div className="flex flex-wrap items-center gap-3">
+                  {!isLiveInspectionRunning ? (
+                    <button
+                      type="button"
+                      onClick={handleStartLiveInspection}
+                      disabled={isRequestingCamera}
+                      className="flex items-center gap-2.5 px-6 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 active:scale-98 text-white text-xs font-mono font-bold rounded-lg transition-all shadow-md shadow-emerald-600/20 cursor-pointer disabled:opacity-50"
+                    >
+                      <Play className="w-4 h-4 fill-white" />
+                      <span>{isRequestingCamera ? 'Initializing Camera...' : 'START LIVE INSPECTION'}</span>
+                    </button>
                   ) : (
-                    <>
-                      <Sparkles className="w-4 h-4 text-yellow-300" />
-                      <span>Run AI Inspection</span>
-                    </>
+                    <button
+                      type="button"
+                      onClick={handleStopLiveInspection}
+                      className="flex items-center gap-2.5 px-6 py-2.5 bg-rose-600 hover:bg-rose-700 active:scale-98 text-white text-xs font-mono font-bold rounded-lg transition-all shadow-md shadow-rose-600/20 cursor-pointer"
+                    >
+                      <Square className="w-4 h-4 fill-white" />
+                      <span>STOP LIVE INSPECTION</span>
+                    </button>
                   )}
-                </button>
+
+                  {/* Camera On/Off Toggle */}
+                  {!isLiveInspectionRunning && (
+                    <button
+                      type="button"
+                      onClick={isCameraActive ? stopCamera : startCamera}
+                      className="flex items-center gap-2 px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-mono font-semibold rounded-lg border border-slate-300 transition-colors cursor-pointer"
+                    >
+                      {isCameraActive ? <VideoOff className="w-4 h-4 text-slate-500" /> : <Video className="w-4 h-4 text-slate-500" />}
+                      <span>{isCameraActive ? 'Turn Off Camera' : 'Test Camera Stream'}</span>
+                    </button>
+                  )}
+                </div>
+              ) : (
+                /* Manual Test Mode Controls */
+                <div className="flex flex-wrap items-center gap-3">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".jpg,.jpeg,.png,image/jpeg,image/png,image/webp"
+                    onChange={handleManualFileUpload}
+                    className="hidden"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="flex items-center gap-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-mono font-semibold rounded-lg border border-slate-300 transition-colors cursor-pointer"
+                  >
+                    <Upload className="w-4 h-4" />
+                    <span>Upload Test Frame</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleRunManualInspection}
+                    disabled={!capturedImage || isAnalyzing}
+                    className="flex items-center gap-2 px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-mono font-bold rounded-lg shadow-xs cursor-pointer disabled:opacity-50"
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    <span>Run Manual AI Inspection</span>
+                  </button>
+
+                  {capturedImage && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCapturedImage(null);
+                        setInspectionResult(null);
+                      }}
+                      className="p-2 text-slate-400 hover:text-rose-600 rounded cursor-pointer"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Right Group: ROI Presets and Sampling FPS */}
+              <div className="flex flex-wrap items-center gap-3 font-mono text-xs">
+                {/* ROI Preset Selector */}
+                <div className="flex items-center gap-1.5 bg-slate-100 p-1 rounded-lg border border-slate-200">
+                  <span className="text-[10px] text-slate-500 px-1 font-semibold">Zone:</span>
+                  {(['compact', 'standard', 'wide'] as const).map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => handleSetRoiPreset(preset)}
+                      className={`px-2 py-0.5 text-[11px] rounded transition-colors cursor-pointer ${
+                        roiPreset === preset
+                          ? 'bg-white text-blue-700 font-bold shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {preset === 'compact' ? '50%' : preset === 'standard' ? '70%' : '85%'}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Sampling FPS Selector */}
+                <div className="flex items-center gap-1.5 bg-slate-100 p-1 rounded-lg border border-slate-200">
+                  <span className="text-[10px] text-slate-500 px-1 font-semibold">FPS:</span>
+                  {[5, 10, 15].map((fpsVal) => (
+                    <button
+                      key={fpsVal}
+                      type="button"
+                      onClick={() => handleChangeFps(fpsVal)}
+                      className={`px-2 py-0.5 text-[11px] rounded transition-colors cursor-pointer ${
+                        liveInspectionFps === fpsVal
+                          ? 'bg-white text-blue-700 font-bold shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {fpsVal}
+                    </button>
+                  ))}
+                </div>
               </div>
 
             </div>
@@ -1048,330 +1218,316 @@ export const InspectionView: React.FC<InspectionViewProps> = ({
           {/* Operational Guidance Callout */}
           <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono text-slate-600 flex items-center justify-between gap-4">
             <div className="flex items-center gap-2.5">
-              <Sparkles className="w-4 h-4 text-blue-600 shrink-0" />
+              <Cpu className="w-4 h-4 text-blue-600 shrink-0" />
               <span>
-                <strong>Algorithm:</strong> Pure browser-compatible PatchCore implementation extracting multi-scale Sobel gradients & color moments to detect defects without server roundtrips.
+                <strong>Continuous Pipeline:</strong> Sampling video feed at {liveInspectionFps} FPS. Product occupancy &amp; motion tracker triggers anomaly inspection upon entering the Inspection Zone, with automated duplicate lockout until exit.
               </span>
             </div>
             <span className="text-[11px] text-slate-400 shrink-0 hidden sm:inline">
-              ISO 9001 Compliant
+              ISO 9001 Conveyor Spec
             </span>
           </div>
 
         </div>
 
-        {/* Right Column (4 cols): Inspection Status Panel & Detailed Anomaly Output */}
+        {/* Right Column (4 cols): Session Metrics, Status, and Diagnostics */}
         <div className="lg:col-span-4 space-y-6">
           
-          {/* Inspection Status Panel (Strict adherence to prompt specifications) */}
-          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs space-y-4">
+          {/* PRODUCT COUNTER & SESSION YIELD PANEL */}
+          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs space-y-4 font-mono">
             <div className="flex items-center justify-between pb-3 border-b border-slate-200">
-              <h3 className="text-xs font-mono font-bold text-slate-900 uppercase tracking-wide flex items-center gap-2">
-                <FileCheck className="w-4 h-4 text-blue-600" />
-                <span>Inspection Status Panel</span>
+              <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wide flex items-center gap-2">
+                <TrendingUp className="w-4 h-4 text-blue-600" />
+                <span>Conveyor Production Metrics</span>
               </h3>
               <span className={`w-2 h-2 rounded-full ${
-                inspectionResult ? (isPass ? 'bg-emerald-500' : 'bg-rose-500') : 'bg-blue-500'
+                isLiveInspectionRunning ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
               }`} />
             </div>
 
-            {/* Required Status Fields */}
-            <div className="space-y-3 font-mono text-xs">
-              
-              {/* Field 1: Status */}
-              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between">
-                <span className="text-slate-500 uppercase tracking-wider text-[11px]">Status</span>
-                <span className="font-bold text-slate-900 bg-white px-2.5 py-0.5 rounded border border-slate-200 flex items-center gap-1.5">
-                  <span className={`w-2 h-2 rounded-full ${
-                    isAnalyzing
-                      ? 'bg-amber-500 animate-ping'
-                      : inspectionResult
-                      ? 'bg-emerald-500'
-                      : capturedImage
-                      ? 'bg-blue-500'
-                      : 'bg-slate-400'
-                  }`} />
-                  {isAnalyzing
-                    ? 'Inferencing...'
-                    : inspectionResult
-                    ? 'Inspection Complete'
-                    : capturedImage
-                    ? 'Frame Ready'
-                    : 'Awaiting Frame'}
+            {/* Total Inspected Counter */}
+            <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between">
+              <div>
+                <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Products Inspected</span>
+                <span className="text-2xl font-bold text-slate-900 tabular-nums">
+                  {sessionInspectedCount}
                 </span>
               </div>
-
-              {/* Field 2: Image */}
-              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex flex-col gap-1">
-                <span className="text-slate-500 uppercase tracking-wider text-[11px]">Image</span>
-                <div className="font-semibold text-slate-900 truncate" title={imageMeta ? imageMeta.name : 'No image selected'}>
-                  {capturedImage && imageMeta ? (
-                    <span className="text-blue-700 flex items-center gap-1.5 truncate">
-                      <ImageIcon className="w-3.5 h-3.5 shrink-0" />
-                      <span className="truncate">{imageMeta.name}</span>
-                    </span>
-                  ) : (
-                    <span className="text-slate-500 italic">No optical frame acquired</span>
-                  )}
-                </div>
-                {imageMeta?.resolution && (
-                  <span className="text-[10px] text-slate-400">
-                    Resolution: {imageMeta.resolution} · {imageMeta.source === 'webcam' ? 'Live Camera Feed' : 'Uploaded File'}
-                  </span>
-                )}
+              <div className="text-right">
+                <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Production Yield</span>
+                <span className="text-base font-bold text-blue-600 tabular-nums">
+                  {yieldPct}%
+                </span>
               </div>
-
-              {/* Field 3: AI Result */}
-              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-slate-500 uppercase tracking-wider text-[11px]">AI Result</span>
-                  {inspectionResult ? (
-                    <span className={`px-2.5 py-0.5 rounded font-bold text-xs flex items-center gap-1 border ${
-                      isPass 
-                        ? 'bg-emerald-100 text-emerald-800 border-emerald-300' 
-                        : 'bg-rose-100 text-rose-800 border-rose-300'
-                    }`}>
-                      {isPass ? (
-                        <>
-                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                          <span>PASS (CONFORMANT)</span>
-                        </>
-                      ) : (
-                        <>
-                          <XCircle className="w-3.5 h-3.5 text-rose-600" />
-                          <span>FAIL (DEFECT)</span>
-                        </>
-                      )}
-                    </span>
-                  ) : (
-                    <span className="font-semibold text-slate-500 bg-white px-2 py-0.5 rounded border border-slate-200 text-[11px]">
-                      Waiting for inspection
-                    </span>
-                  )}
-                </div>
-
-                {/* Score vs Threshold Meter (When Inspection is Complete) */}
-                {inspectionResult && (
-                  <div className="pt-2 border-t border-slate-200 space-y-1.5">
-                    <div className="flex justify-between items-baseline text-[11px]">
-                      <span className="text-slate-500">Anomaly Score:</span>
-                      <span className={`text-base font-bold ${isPass ? 'text-emerald-700' : 'text-rose-700'}`}>
-                        {inspectionResult.anomalyScore.toFixed(2)}
-                        <span className="text-xs text-slate-400 font-normal ml-1">/ {inspectionResult.threshold.toFixed(2)} thres</span>
-                      </span>
-                    </div>
-
-                    {/* Progress Bar Gauge */}
-                    <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden relative">
-                      {/* Threshold marker tick */}
-                      <div 
-                        className="absolute top-0 bottom-0 w-0.5 bg-slate-900 z-10" 
-                        style={{ left: `${Math.min(100, inspectionResult.threshold * 100)}%` }}
-                        title={`Threshold: ${inspectionResult.threshold.toFixed(2)}`}
-                      />
-                      <div 
-                        className={`h-full transition-all duration-500 ${
-                          isPass ? 'bg-emerald-500' : 'bg-rose-500'
-                        }`}
-                        style={{ width: `${Math.min(100, inspectionResult.anomalyScore * 100)}%` }}
-                      />
-                    </div>
-
-                    <div className="flex justify-between text-[10px] text-slate-400">
-                      <span>0.00 (Nominal)</span>
-                      <span className="font-semibold text-slate-700">Limit: {inspectionResult.threshold.toFixed(2)}</span>
-                      <span>1.00 (Defect)</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-
             </div>
 
-            {/* Suspected Defect Region Details (When defect localized) */}
-            {inspectionResult && (
-              <div className={`p-3.5 rounded-lg border text-xs font-mono space-y-2 ${
-                isPass ? 'bg-emerald-50/70 border-emerald-200' : 'bg-rose-50/70 border-rose-200'
-              }`}>
-                <div className="flex items-center justify-between">
-                  <span className="font-bold flex items-center gap-1.5">
-                    {isPass ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                    ) : (
-                      <Flame className="w-4 h-4 text-rose-600" />
+            {/* PASS / FAIL Counters */}
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div className="p-3 bg-emerald-50/80 border border-emerald-200 rounded-lg">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-[10px] text-emerald-800 font-bold uppercase">Conformant</span>
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                </div>
+                <div className="text-xl font-bold text-emerald-700 tabular-nums">
+                  {sessionPassCount}
+                </div>
+              </div>
+
+              <div className="p-3 bg-rose-50/80 border border-rose-200 rounded-lg">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-[10px] text-rose-800 font-bold uppercase">Rejected</span>
+                  <XCircle className="w-3.5 h-3.5 text-rose-600" />
+                </div>
+                <div className="text-xl font-bold text-rose-700 tabular-nums">
+                  {sessionFailCount}
+                </div>
+              </div>
+            </div>
+
+            {/* Live Inspection Timing Metrics */}
+            <div className="pt-2 border-t border-slate-100 text-[11px] space-y-1.5 text-slate-600">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Sampling Speed:</span>
+                <span className="font-semibold text-slate-900 tabular-nums">{liveDiagnostics.processingFps} FPS</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Avg Inspection Time:</span>
+                <span className="font-semibold text-slate-900 tabular-nums">{liveDiagnostics.averageInferenceTimeMs} ms</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Last Inspection Time:</span>
+                <span className="font-semibold text-slate-900 tabular-nums">{liveDiagnostics.lastInferenceTimeMs} ms</span>
+              </div>
+            </div>
+          </div>
+
+          {/* ACTIVE PRODUCT & PROFILE INFO */}
+          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs font-mono text-xs space-y-3">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-200">
+              <h4 className="font-bold text-slate-900 uppercase text-[11px] flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-blue-600" />
+                <span>Station Configuration</span>
+              </h4>
+              <span className="text-[10px] text-slate-400">{currentProduct?.sku || 'SKU-N/A'}</span>
+            </div>
+
+            <div className="space-y-2 text-slate-600 text-[11px]">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Target Part:</span>
+                <span className="font-semibold text-slate-900 truncate max-w-[180px]">{currentProduct?.name || 'None selected'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Rejection Threshold:</span>
+                <span className="font-semibold text-blue-700">{effectiveThreshold.toFixed(2)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Normal Reference Model:</span>
+                <span className="font-semibold text-slate-900">{referenceImages.length} images</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Conveyor Inspection Zone:</span>
+                <span className="font-semibold text-slate-900">
+                  {Math.round(roiConfig.width * 100)}% × {Math.round(roiConfig.height * 100)}%
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* COLLAPSIBLE PIPELINE DIAGNOSTICS */}
+          <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs font-mono text-xs">
+            <button
+              type="button"
+              onClick={() => setShowDebugInfo(!showDebugInfo)}
+              className="w-full flex items-center justify-between text-slate-700 hover:text-slate-900 font-bold transition-colors cursor-pointer"
+            >
+              <span className="flex items-center gap-1.5">
+                <Activity className="w-3.5 h-3.5 text-blue-600" />
+                <span>Live Conveyor Diagnostics</span>
+              </span>
+              <span className="text-[10px] text-slate-500 bg-slate-100 hover:bg-slate-200 px-2 py-0.5 rounded font-normal transition-colors">
+                {showDebugInfo ? 'Hide ▲' : 'Inspect ▼'}
+              </span>
+            </button>
+
+            {showDebugInfo && (
+              <div className="mt-3 pt-3 border-t border-slate-100 space-y-1.5 text-[11px] text-slate-600 animate-fadeIn max-h-[380px] overflow-y-auto pr-1">
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Camera FPS:</span>
+                  <span className="font-semibold text-slate-900">{liveDiagnostics.cameraFps} FPS</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Processing FPS:</span>
+                  <span className="font-semibold text-slate-900">{liveDiagnostics.processingFps} FPS</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Current State:</span>
+                  <span className="font-bold text-blue-700">{liveDiagnostics.currentState}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">ROI Occupancy:</span>
+                  <span className="font-semibold text-slate-900">{liveDiagnostics.roiOccupancy}%</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Product Detection Score:</span>
+                  <span className="font-semibold text-slate-900">{liveDiagnostics.productDetectionScore}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Blur / Sharpness Score:</span>
+                  <span className="font-semibold text-slate-900">{liveDiagnostics.blurScore}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Frames Sampled:</span>
+                  <span className="font-semibold text-slate-900">{liveDiagnostics.framesSampled}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Frames Inspected:</span>
+                  <span className="font-semibold text-slate-900">{liveDiagnostics.framesInspected}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Products Detected:</span>
+                  <span className="font-semibold text-slate-900">{liveDiagnostics.productsDetected}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Products Inspected:</span>
+                  <span className="font-semibold text-slate-900">{liveDiagnostics.productsInspected}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Products Skipped:</span>
+                  <span className="font-semibold text-slate-900">{liveDiagnostics.productsSkipped}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Bottleneck Status:</span>
+                  <span className={`font-bold ${liveDiagnostics.isBottleneck ? 'text-rose-600' : 'text-emerald-600'}`}>
+                    {liveDiagnostics.isBottleneck ? 'BOTTLENECK DETECTED' : 'NORMAL'}
+                  </span>
+                </div>
+                {/* INSPECTION PIPELINE & ALIGNMENT DIAGNOSTICS */}
+                {inspectionResult?.debugInfo ? (
+                  <>
+                    <div className="pt-2.5 border-t border-slate-200">
+                      <div className="font-bold text-slate-800 text-[11px] mb-1.5 flex items-center justify-between">
+                        <span>Pipeline &amp; Alignment Metrics</span>
+                        <span className="text-[10px] text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded font-mono">
+                          {inspectionResult.debugInfo.inferenceTimeMs}ms
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Normal Reference Images:</span>
+                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.referenceImageCount} images</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Total Patches Extracted:</span>
+                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.totalPatchesExtracted}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Coreset Memory Bank:</span>
+                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.coresetSize} vectors</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Preprocessing Canvas:</span>
+                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.preprocessingDimensions}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Product Segmentation ROI:</span>
+                      <span className="font-semibold text-slate-900 truncate max-w-[190px]" title={inspectionResult.debugInfo.roiDimensions}>
+                        {inspectionResult.debugInfo.roiDimensions}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Alignment Transform:</span>
+                      <span className="font-semibold text-slate-900 truncate max-w-[190px]" title={inspectionResult.debugInfo.alignmentTransform}>
+                        {inspectionResult.debugInfo.alignmentTransform}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Translation (dX / dY):</span>
+                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.translationX}px / {inspectionResult.debugInfo.translationY}px</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Scale / Rotation:</span>
+                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.scale}x / {inspectionResult.debugInfo.rotationDeg}°</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Alignment Score:</span>
+                      <span className="font-semibold text-emerald-700">{inspectionResult.debugInfo.alignmentScore}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Image Quality Score:</span>
+                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.imageQualityScore}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Baseline Mean (μ) / Std (σ):</span>
+                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.nominalMeanDist} / {inspectionResult.debugInfo.nominalStdDist}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Baseline P50 / P90:</span>
+                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.normalScoreP50} / {inspectionResult.debugInfo.normalScoreP90}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Baseline P95 / P99:</span>
+                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.normalScoreP95} / {inspectionResult.debugInfo.normalScoreP99}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Max Patch / Top-K Dist:</span>
+                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.maxPatchDist} / {inspectionResult.debugInfo.topKMeanDist}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Anomaly Regions Count:</span>
+                      <span className={`font-semibold ${inspectionResult.debugInfo.numberOfAnomalyRegions > 0 ? 'text-rose-600' : 'text-slate-900'}`}>
+                        {inspectionResult.debugInfo.numberOfAnomalyRegions}
+                      </span>
+                    </div>
+                    {inspectionResult.debugInfo.numberOfAnomalyRegions > 0 && (
+                      <div className="flex justify-between">
+                        <span className="text-slate-400">Strongest Region Area:</span>
+                        <span className="font-semibold text-rose-600">{inspectionResult.debugInfo.strongestRegionArea}</span>
+                      </div>
                     )}
-                    <span>{isPass ? 'Nominal Surface Verified' : 'Suspected Defect Localized'}</span>
-                  </span>
-                  <span className="text-[10px] text-slate-500">
-                    {inspectionResult.inferenceTimeMs} ms latency
-                  </span>
-                </div>
-
-                {!isPass && inspectionResult.suspectedDefectRegion && (
-                  <div className="space-y-1 text-[11px] text-rose-900">
-                    <div className="flex justify-between">
-                      <span className="text-rose-700">Peak Coordinate:</span>
-                      <span className="font-bold">
-                        X: {inspectionResult.maxAnomalyCoord.x}px, Y: {inspectionResult.maxAnomalyCoord.y}px
-                      </span>
+                    <div className="text-[10px] text-slate-500 italic pt-1.5 border-t border-slate-100">
+                      {inspectionResult.debugInfo.calibrationStatus}
+                    </div>
+                  </>
+                ) : memoryBank ? (
+                  <>
+                    <div className="pt-2 border-t border-slate-100 flex justify-between">
+                      <span className="text-slate-400">Coreset Memory Bank:</span>
+                      <span className="font-semibold text-slate-900">{memoryBank.coresetVectors.length} vectors</span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-rose-700">Defect Region Bounds:</span>
-                      <span className="font-bold">
-                        {inspectionResult.suspectedDefectRegion.width} × {inspectionResult.suspectedDefectRegion.height} px
-                      </span>
+                      <span className="text-slate-400">Normal Baseline Mean (μ):</span>
+                      <span className="font-semibold text-slate-900">{memoryBank.nominalMeanDist}</span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-rose-700">Anomaly Confidence:</span>
-                      <span className="font-bold">{inspectionResult.suspectedDefectRegion.confidence}%</span>
+                      <span className="text-slate-400">Normal Baseline P95:</span>
+                      <span className="font-semibold text-slate-900">{memoryBank.nominalP95}</span>
                     </div>
-                  </div>
-                )}
-
-                {isPass && (
-                  <div className="text-[11px] text-emerald-800">
-                    All 588 spatial patches fall within nominal tolerance limits established by the reference dataset.
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Confirmation of Persistence to Firestore */}
-            {lastSavedId && (
-              <div className="p-3 bg-blue-50/80 border border-blue-200 rounded-lg text-[11px] text-blue-900 font-mono space-y-1">
-                <div className="flex items-center gap-1.5 font-bold">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-                  <span>Logged to Firestore Database</span>
-                </div>
-                <div className="text-blue-800 truncate">
-                  Record ID: <span className="font-bold">{lastSavedId}</span>
-                </div>
-                <div className="text-[10px] text-blue-600">
-                  Visible in History audit trail & Dashboard rejection metrics.
-                </div>
-              </div>
-            )}
-
-            {/* No Reference Images Callout */}
-            {referenceImages.length === 0 && (
-              <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-[11px] text-amber-900 font-mono space-y-1.5">
-                <div className="font-bold flex items-center gap-1.5">
-                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                  <span>Setup Requirement</span>
-                </div>
-                <p className="leading-relaxed text-amber-800">
-                  Please upload 1 or more defect-free normal reference images in the <strong>Dataset tab</strong> before running anomaly detection.
-                </p>
-                {onNavigate && (
-                  <button
-                    type="button"
-                    onClick={() => onNavigate('dataset')}
-                    className="w-full mt-1 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded font-bold text-center transition-colors"
-                  >
-                    Open Dataset Tab →
-                  </button>
-                )}
-              </div>
-            )}
-
-          </div>
-
-          {/* Part Specifications Reference Card */}
-          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs space-y-3 font-mono text-xs">
-            <div className="pb-2 border-b border-slate-200 flex items-center justify-between">
-              <span className="font-bold text-slate-900 uppercase">Target Specifications</span>
-              <span className="text-[10px] text-slate-400">{currentProduct ? currentProduct.sku : 'NONE'}</span>
-            </div>
-
-            {currentProduct ? (
-              <div className="space-y-2 text-slate-600">
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Component:</span>
-                  <span className="font-semibold text-slate-900">{currentProduct.name}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Nominal Threshold:</span>
-                  <span className="font-semibold text-blue-700">{effectiveThreshold.toFixed(2)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Reference Model:</span>
-                  <span className="font-semibold text-slate-800">{referenceImages.length} normal samples</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Station Line:</span>
-                  <span className="font-semibold text-slate-800">{currentProduct.activeLine || 'Cell QC-01'}</span>
-                </div>
-              </div>
-            ) : (
-              <div className="py-2 text-center text-slate-400">
-                <span className="text-xs">No product registered yet.</span>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Normal Baseline P99:</span>
+                      <span className="font-semibold text-slate-900">{memoryBank.nominalP99}</span>
+                    </div>
+                    <div className="text-[10px] text-slate-500 italic pt-1">
+                      {memoryBank.calibrationStatus}
+                    </div>
+                  </>
+                ) : null}
               </div>
             )}
           </div>
 
-          {/* Development / Quality Pipeline Diagnostics (Collapsible) */}
-          {inspectionResult?.debugInfo && (
-            <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs font-mono text-xs">
-              <button
-                type="button"
-                onClick={() => setShowDebugInfo(!showDebugInfo)}
-                className="w-full flex items-center justify-between text-slate-700 hover:text-slate-900 font-bold transition-colors cursor-pointer"
-              >
-                <span className="flex items-center gap-1.5">
-                  <Activity className="w-3.5 h-3.5 text-blue-600" />
-                  <span>Pipeline Diagnostics</span>
-                </span>
-                <span className="text-[10px] text-slate-500 bg-slate-100 hover:bg-slate-200 px-2 py-0.5 rounded font-normal transition-colors">
-                  {showDebugInfo ? 'Hide ▲' : 'Inspect ▼'}
-                </span>
-              </button>
-
-              {showDebugInfo && (
-                <div className="mt-3 pt-3 border-t border-slate-100 space-y-1.5 text-[11px] text-slate-600 animate-fadeIn">
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Reference Images:</span>
-                    <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.referenceImagesCount}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Extracted Patches:</span>
-                    <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.totalPatchesExtracted}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Coreset Memory Bank:</span>
-                    <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.coresetSize} vectors</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Nominal Mean Dist (μ):</span>
-                    <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.nominalMeanDist}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Nominal Std Dev (σ):</span>
-                    <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.nominalStdDist}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Max Patch Distance:</span>
-                    <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.maxPatchDist}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Top-3% Mean Distance:</span>
-                    <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.topKMeanDist}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Final Anomaly Score:</span>
-                    <span className="font-bold text-blue-700">{inspectionResult.debugInfo.finalAnomalyScore}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Product Threshold:</span>
-                    <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.threshold}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Result:</span>
-                    <span className={`font-bold ${inspectionResult.debugInfo.result === 'PASS' ? 'text-emerald-700' : 'text-rose-700'}`}>
-                      {inspectionResult.debugInfo.result}
-                    </span>
-                  </div>
-                </div>
-              )}
+          {/* PERSISTENCE CONFIRMATION */}
+          {lastSavedId && (
+            <div className="p-3 bg-blue-50/80 border border-blue-200 rounded-lg text-[11px] text-blue-900 font-mono space-y-1">
+              <div className="flex items-center gap-1.5 font-bold">
+                <CheckCircle2 className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                <span>Latest Inspection Logged to Firestore</span>
+              </div>
+              <div className="text-blue-800 truncate">
+                Record ID: <span className="font-bold">{lastSavedId}</span>
+              </div>
+              <div className="text-[10px] text-blue-600">
+                Visible in History audit trail &amp; Dashboard live metrics.
+              </div>
             </div>
           )}
 

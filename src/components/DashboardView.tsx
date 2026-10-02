@@ -317,6 +317,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               ) : (
                 recentInspections.map((item) => {
                   const isItemPass = item.status === 'PASS';
+                  const isItemInvalid = item.status === 'INVALID';
                   const svgType = getSvgForPart(item.product_name, isItemPass);
 
                   return (
@@ -361,6 +362,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                           px-2.5 py-1 rounded text-xs font-mono font-bold border tracking-wider
                           ${isItemPass 
                             ? 'bg-emerald-50 text-emerald-700 border-emerald-200' 
+                            : isItemInvalid
+                            ? 'bg-amber-50 text-amber-800 border-amber-200'
                             : 'bg-rose-50 text-rose-700 border-rose-200'}
                         `}>
                           {item.status}

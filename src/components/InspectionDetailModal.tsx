@@ -17,6 +17,7 @@ export const InspectionDetailModal: React.FC<InspectionDetailModalProps> = ({
   if (!record) return null;
 
   const isPass = record.status === 'PASS';
+  const isInvalid = record.status === 'INVALID';
   const name = (record.product_name || '').toLowerCase();
   const svgType = name.includes('bearing')
     ? (isPass ? 'bearing-pass' : 'bearing-fail')
@@ -53,6 +54,8 @@ export const InspectionDetailModal: React.FC<InspectionDetailModalProps> = ({
               px-2.5 py-1 rounded text-xs font-mono font-bold border tracking-wider
               ${isPass 
                 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' 
+                : isInvalid
+                ? 'bg-amber-50 text-amber-800 border-amber-200'
                 : 'bg-rose-50 text-rose-700 border-rose-200'}
             `}>
               {record.status}
@@ -167,7 +170,17 @@ export const InspectionDetailModal: React.FC<InspectionDetailModalProps> = ({
         </div>
 
         {/* Defect Diagnostics Description */}
-        {!isPass ? (
+        {isInvalid ? (
+          <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-md text-xs font-mono text-amber-800 space-y-1">
+            <div className="font-bold flex items-center gap-1.5 text-amber-900">
+              <AlertCircle className="w-4 h-4 text-amber-600" />
+              <span>Inspection Invalid — Optical Quality Alert</span>
+            </div>
+            <div className="text-amber-700 text-[11px]">
+              {record.defectType || 'Image did not meet quality thresholds (excessive blur, darkness, or saturation). Frame rejected before scoring to prevent false fail.'}
+            </div>
+          </div>
+        ) : !isPass ? (
           <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-md text-xs font-mono text-rose-800 space-y-1">
             <div className="font-bold flex items-center justify-between text-rose-900">
               <span className="flex items-center gap-1.5">

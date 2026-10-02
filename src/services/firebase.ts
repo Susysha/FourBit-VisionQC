@@ -27,7 +27,7 @@ import {
   Unsubscribe
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
-import { ProductPart, DatasetItem, InspectionRecord } from '../types';
+import { ProductPart, DatasetItem, InspectionRecord, QualityStatus } from '../types';
 
 // Initialize Firebase App
 const app = initializeApp(firebaseConfig);
@@ -412,7 +412,7 @@ export async function getUserInspections(userId: string): Promise<InspectionReco
 
 export async function addInspectionRecord(
   userId: string,
-  recordData: Partial<InspectionRecord> & { productName: string; status: 'PASS' | 'FAIL'; anomalyScore: number; threshold: number }
+  recordData: Partial<InspectionRecord> & { productName: string; status: QualityStatus; anomalyScore: number; threshold: number }
 ): Promise<InspectionRecord> {
   const inspectionId = recordData.id || `QC-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.floor(1000 + Math.random() * 9000)}`;
   const path = `users/${userId}/inspections/${inspectionId}`;
@@ -446,6 +446,7 @@ export async function addInspectionRecord(
     heatmapUrl: recordData.heatmapUrl || '',
     overlayUrl: recordData.overlayUrl || '',
     inferenceTimeMs: recordData.inferenceTimeMs,
+    source: recordData.source || 'live_camera',
   };
 
   try {

@@ -1,4 +1,5 @@
 import initSqlJs, { Database } from 'sql.js';
+import { QualityStatus } from '../types';
 
 export interface SqliteInspection {
   id: string;
@@ -6,7 +7,7 @@ export interface SqliteInspection {
   product_name: string;
   anomaly_score: number;
   threshold: number;
-  result: 'PASS' | 'FAIL';
+  result: QualityStatus;
   image_path: string;
 }
 

@@ -1,6 +1,6 @@
 export type NavSection = 'dashboard' | 'inspection' | 'dataset' | 'history' | 'settings';
 
-export type QualityStatus = 'PASS' | 'FAIL';
+export type QualityStatus = 'PASS' | 'FAIL' | 'INVALID';
 
 export interface ProductPart {
   id: string;
@@ -21,6 +21,8 @@ export interface DefectRegion {
   height?: number;
   gridX?: number;
   gridY?: number;
+  area?: number;
+  areaPct?: number;
   confidence?: number;
   description?: string;
 }
@@ -53,6 +55,7 @@ export interface InspectionRecord {
   heatmapUrl?: string;
   overlayUrl?: string;
   inferenceTimeMs?: number;
+  source?: 'live_camera' | 'manual_upload';
 }
 
 export interface DatasetItem {

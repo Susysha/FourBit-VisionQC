@@ -213,6 +213,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
               ) : (
                 sortedRecords.map((item) => {
                   const isPass = item.status === 'PASS';
+                  const isInvalid = item.status === 'INVALID';
                   const svgType = getSvgForPart(item.product_name, isPass);
                   const hasImage = !!(item.imageUrl || item.imageDataUrl);
 
@@ -249,7 +250,13 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                       </td>
 
                       <td className="py-3 px-3 text-right tabular-nums">
-                        <span className={`font-bold ${isPass ? 'text-emerald-600' : 'text-rose-600'}`}>
+                        <span className={`font-bold ${
+                          isPass 
+                            ? 'text-emerald-600' 
+                            : isInvalid 
+                            ? 'text-amber-600' 
+                            : 'text-rose-600'
+                        }`}>
                           {(item.anomaly_score ?? item.anomalyScore).toFixed(2)}
                         </span>
                       </td>
@@ -263,6 +270,8 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                           px-2.5 py-0.5 rounded text-[11px] font-bold border tracking-wider
                           ${isPass 
                             ? 'bg-emerald-50 text-emerald-700 border-emerald-200' 
+                            : isInvalid
+                            ? 'bg-amber-50 text-amber-800 border-amber-200'
                             : 'bg-rose-50 text-rose-700 border-rose-200'}
                         `}>
                           {item.status}
