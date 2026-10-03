@@ -1,49 +1,24 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { ProductPart, InspectionRecord, NavSection, DefectRegion, QualityStatus } from '../types';
-import { useAuth } from '../contexts/AuthContext';
-import { getUserDatasets } from '../services/firebase';
-import { getProductDataset } from '../services/datasetStore';
-import { 
-  buildPatchCoreMemoryBank, 
-  inspectImageWithPatchCore, 
-  PatchCoreMemoryBank, 
-  PatchCoreInspectionResult,
-  compressImageForStorage 
-} from '../services/patchcore';
+import React, { useState, useRef, useEffect } from 'react';
+import { ProductPart, InspectionRecord, NavSection } from '../types';
+import { matchCanonicalWasher, CanonicalMatchResult, renderCanonicalHeatmapCanvas } from '../services/canonicalMatcher';
 import {
-  LiveConveyorTracker,
-  ConveyorState,
-  RoiNormalized,
-  LiveDiagnostics,
-  DEFAULT_LIVE_INSPECTION_FPS,
-  DEFAULT_ROI_NORMALIZED,
-} from '../services/liveInspection';
-import { 
-  Camera, 
-  Video, 
-  VideoOff, 
-  Upload, 
-  CheckCircle2, 
-  XCircle, 
-  AlertTriangle, 
-  Play, 
-  Square,
+  Upload,
+  CheckCircle2,
+  XCircle,
+  AlertTriangle,
   Sparkles,
-  ArrowRight,
-  Crosshair,
-  Layers,
   Image as ImageIcon,
   Trash2,
   FileCheck,
   Activity,
-  Flame,
   Loader2,
-  Sliders,
   ShieldCheck,
-  Box,
   TrendingUp,
-  Cpu,
-  AlertCircle
+  AlertCircle,
+  FolderGit2,
+  Layers,
+  RefreshCw,
+  Info,
 } from 'lucide-react';
 
 interface InspectionViewProps {
@@ -58,1689 +33,538 @@ interface InspectionViewProps {
   onCreateProduct?: () => void;
 }
 
-type ViewMode = 'live' | 'original' | 'heatmap' | 'overlay';
-type StationTab = 'conveyor' | 'manual';
+type ViewMode = 'original' | 'overlay' | 'heatmap';
 
-/**
- * Web Audio API Industrial Audio Feedback
- */
+/** Industrial audio alert tone */
 function playIndustrialAlert(isPass: boolean) {
   try {
     const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
     if (!AudioContextClass) return;
     const ctx = new AudioContextClass();
     const now = ctx.currentTime;
-
     if (isPass) {
-      // Crisp dual-tone industrial acceptance beep
-      const osc1 = ctx.createOscillator();
-      const gain1 = ctx.createGain();
-      osc1.type = 'sine';
-      osc1.frequency.setValueAtTime(880, now);
-      osc1.frequency.exponentialRampToValueAtTime(1320, now + 0.08);
-      gain1.gain.setValueAtTime(0.12, now);
-      gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
-      osc1.connect(gain1);
-      gain1.connect(ctx.destination);
-      osc1.start(now);
-      osc1.stop(now + 0.12);
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(880, now);
+      osc.frequency.exponentialRampToValueAtTime(1320, now + 0.08);
+      gain.gain.setValueAtTime(0.12, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.12);
     } else {
-      // Industrial rejection buzz
-      const osc1 = ctx.createOscillator();
-      const gain1 = ctx.createGain();
-      osc1.type = 'sawtooth';
-      osc1.frequency.setValueAtTime(180, now);
-      gain1.gain.setValueAtTime(0.18, now);
-      gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
-      osc1.connect(gain1);
-      gain1.connect(ctx.destination);
-      osc1.start(now);
-      osc1.stop(now + 0.28);
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(180, now);
+      gain.gain.setValueAtTime(0.18, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.28);
     }
   } catch {
-    // Autoplay restrictions or background tab
+    // Audio context autoplay policy fallback
   }
 }
 
 export const InspectionView: React.FC<InspectionViewProps> = ({
   products,
   currentProduct,
-  threshold,
   audibleAlerts = true,
-  onUpdateThreshold,
   onSelectProduct,
   onRecordInspection,
   onNavigate,
   onCreateProduct,
 }) => {
-  const { currentUser } = useAuth();
-
-  // Mode Selection: Live Conveyor Inspection (Default) vs Manual Test Mode
-  const [activeTab, setActiveTab] = useState<StationTab>('conveyor');
-
-  // Video and Media Stream Refs
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Camera state
-  const [isCameraActive, setIsCameraActive] = useState<boolean>(false);
-  const [isRequestingCamera, setIsRequestingCamera] = useState<boolean>(false);
-  const [cameraError, setCameraError] = useState<string | null>(null);
-  const [streamInfo, setStreamInfo] = useState<{ width: number; height: number; fps: number } | null>(null);
+  // Active uploaded image state
+  const [uploadedImage, setUploadedImage] = useState<string | null>(null);
+  const [imageFileName, setImageFileName] = useState<string>('');
+  const [imageMeta, setImageMeta] = useState<{ resolution: string; size: string } | null>(null);
 
-  // Autonomous Conveyor Belt System State
-  const [isLiveInspectionRunning, setIsLiveInspectionRunning] = useState<boolean>(false);
-  const [conveyorState, setConveyorState] = useState<ConveyorState>('IDLE');
-  const [liveInspectionFps, setLiveInspectionFps] = useState<number>(DEFAULT_LIVE_INSPECTION_FPS);
-  const [roiConfig, setRoiConfig] = useState<RoiNormalized>({ ...DEFAULT_ROI_NORMALIZED });
-  const [roiPreset, setRoiPreset] = useState<'standard' | 'compact' | 'wide'>('standard');
-
-  // Session Inspection Counters
-  const [sessionInspectedCount, setSessionInspectedCount] = useState<number>(0);
-  const [sessionPassCount, setSessionPassCount] = useState<number>(0);
-  const [sessionFailCount, setSessionFailCount] = useState<number>(0);
-
-  // Latest Live Result Banner
-  const [currentLiveResult, setCurrentLiveResult] = useState<{
-    result: QualityStatus;
-    anomalyScore: number;
-    threshold: number;
-    productIndex: number;
-    defectRegion?: DefectRegion;
-    timestamp: string;
-  } | null>(null);
-
-  // Live Performance & Bottleneck Diagnostics
-  const [liveDiagnostics, setLiveDiagnostics] = useState<LiveDiagnostics>({
-    cameraFps: 0,
-    processingFps: 0,
-    currentState: 'IDLE',
-    roiOccupancy: 0,
-    productDetectionScore: 0,
-    blurScore: 0,
-    framesSampled: 0,
-    framesInspected: 0,
-    productsDetected: 0,
-    productsInspected: 0,
-    productsSkipped: 0,
-    averageInferenceTimeMs: 0,
-    lastInferenceTimeMs: 0,
-    isBottleneck: false,
-  });
-
-  // Manual Test Mode Captured Image
-  const [capturedImage, setCapturedImage] = useState<string | null>(null);
-  const [imageMeta, setImageMeta] = useState<{
-    source: 'webcam' | 'upload';
-    name: string;
-    timestamp: string;
-    resolution?: string;
-  } | null>(null);
-
-  const [activeViewMode, setActiveViewMode] = useState<ViewMode>('live');
-  const [showDebugInfo, setShowDebugInfo] = useState<boolean>(false);
-
-  // Normal Reference Representation state
-  const [referenceImages, setReferenceImages] = useState<{ id: string; dataUrl: string; fileName: string }[]>([]);
-  const [isLoadingReferences, setIsLoadingReferences] = useState<boolean>(false);
-  const [memoryBank, setMemoryBank] = useState<PatchCoreMemoryBank | null>(null);
-  const [isTrainingMemoryBank, setIsTrainingMemoryBank] = useState<boolean>(false);
-  const [trainingProgress, setTrainingProgress] = useState<number>(0);
-
-  // Active AI Inspection Result state
+  // Inspection & matching state
   const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
   const [analysisStep, setAnalysisStep] = useState<string>('');
-  const [inspectionResult, setInspectionResult] = useState<PatchCoreInspectionResult | null>(null);
-  const [lastSavedId, setLastSavedId] = useState<string | null>(null);
+  const [matchResult, setMatchResult] = useState<CanonicalMatchResult | null>(null);
+  const [activeViewMode, setActiveViewMode] = useState<ViewMode>('original');
 
-  // Tracker and Memory Bank Caches
-  const trackerRef = useRef<LiveConveyorTracker>(new LiveConveyorTracker(roiConfig, liveInspectionFps));
-  const memoryBankCacheRef = useRef<Map<string, { bank: PatchCoreMemoryBank; count: number }>>(new Map());
-  const loopIntervalRef = useRef<number | null>(null);
-  // Monotonically-incrementing token that identifies the current inspection cycle.
-  // Captured at the start of handleAutoInspect; compared before any result is applied
-  // to discard results that arrived after the product exited or a new cycle started.
-  const inspectionTokenRef = useRef<number>(0);
+  // Heatmap rendered images
+  const [renderedHeatmapUrl, setRenderedHeatmapUrl] = useState<string | null>(null);
+  const [renderedOverlayUrl, setRenderedOverlayUrl] = useState<string | null>(null);
 
-  // 1. Load normal reference images for current product from users/{userId}/datasets
-  useEffect(() => {
-    if (!currentProduct || !currentUser) {
-      setReferenceImages([]);
-      setMemoryBank(null);
-      return;
-    }
+  // Session stats
+  const [sessionInspected, setSessionInspected] = useState<number>(0);
+  const [sessionPass, setSessionPass] = useState<number>(0);
+  const [sessionFail, setSessionFail] = useState<number>(0);
 
-    let isMounted = true;
-    setIsLoadingReferences(true);
-
-    const loadProductReferences = async () => {
-      try {
-        const items = await getUserDatasets(currentUser.uid, currentProduct.id);
-        if (!isMounted) return;
-
-        if (items && items.length > 0) {
-          const valid = items
-            .filter((it) => it.dataUrl && it.dataUrl.length > 0)
-            .map((it) => ({
-              id: it.id,
-              dataUrl: it.dataUrl as string,
-              fileName: it.fileName,
-            }));
-          setReferenceImages(valid);
-        } else {
-          const localItems = getProductDataset(currentProduct.name, currentUser.uid);
-          const valid = localItems
-            .filter((it) => it.dataUrl && it.dataUrl.length > 0)
-            .map((it) => ({
-              id: it.id,
-              dataUrl: it.dataUrl,
-              fileName: it.fileName,
-            }));
-          setReferenceImages(valid);
-        }
-      } catch (err) {
-        console.warn('Error loading reference images from Firestore:', err);
-        const localItems = getProductDataset(currentProduct.name, currentUser.uid);
-        if (isMounted) {
-          setReferenceImages(
-            localItems.map((it) => ({
-              id: it.id,
-              dataUrl: it.dataUrl,
-              fileName: it.fileName,
-            }))
-          );
-        }
-      } finally {
-        if (isMounted) setIsLoadingReferences(false);
-      }
-    };
-
-    loadProductReferences();
-
-    const cached = memoryBankCacheRef.current.get(currentProduct.id);
-    if (cached) {
-      setMemoryBank(cached.bank);
-    } else {
-      setMemoryBank(null);
-    }
-
-    setInspectionResult(null);
-    setLastSavedId(null);
-
-    return () => {
-      isMounted = false;
-    };
-  }, [currentProduct?.id, currentUser?.uid]);
-
-  /**
-   * Stop camera stream tracks and clear stream reference
-   */
-  const stopCamera = useCallback(() => {
-    if (streamRef.current) {
-      try {
-        streamRef.current.getTracks().forEach((track) => {
-          track.stop();
-        });
-      } catch (err) {
-        console.warn('Error stopping camera tracks:', err);
-      }
-      streamRef.current = null;
-    }
-
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-
-    setIsCameraActive(false);
-    setIsRequestingCamera(false);
-    setStreamInfo(null);
-  }, []);
-
-  /**
-   * Start continuous live camera stream
-   */
-  const startCamera = useCallback(async (): Promise<boolean> => {
-    setCameraError(null);
-    setIsRequestingCamera(true);
-
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setCameraError(
-        'Browser camera unavailable: The MediaDevices API is not supported in this browser or is restricted.'
-      );
-      setIsRequestingCamera(false);
-      return false;
-    }
-
-    if (streamRef.current && isCameraActive) {
-      setIsRequestingCamera(false);
-      return true;
-    }
-
-    try {
-      let stream: MediaStream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: 1280, min: 640 },
-            height: { ideal: 720, min: 480 },
-            facingMode: 'environment',
-          },
-          audio: false,
-        });
-      } catch (firstErr) {
-        console.warn('Ideal camera constraints failed, attempting fallback:', firstErr);
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: false,
-        });
-      }
-
-      streamRef.current = stream;
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.setAttribute('playsinline', 'true');
-        videoRef.current.muted = true;
-
-        videoRef.current.onloadedmetadata = async () => {
-          if (videoRef.current) {
-            try {
-              await videoRef.current.play();
-              setStreamInfo({
-                width: videoRef.current.videoWidth || 1280,
-                height: videoRef.current.videoHeight || 720,
-                fps: 30,
-              });
-            } catch (playErr) {
-              console.warn('Video play interrupted:', playErr);
-            }
-          }
-        };
-      }
-
-      setIsCameraActive(true);
-      setActiveViewMode('live');
-      setCameraError(null);
-      return true;
-    } catch (err: any) {
-      console.error('Camera access error:', err);
-      setIsCameraActive(false);
-
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        setCameraError(
-          'Camera permission denied: Please enable camera permissions in your browser to inspect live parts.'
-        );
-      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-        setCameraError(
-          'No camera detected: Connect a USB or industrial web camera to enable optical inspection.'
-        );
-      } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
-        setCameraError(
-          'Camera already in use: Another program or browser tab is accessing the camera device.'
-        );
-      } else {
-        setCameraError(`Camera initialization error: ${err.message || 'Unable to open camera.'}`);
-      }
-      return false;
-    } finally {
-      setIsRequestingCamera(false);
-    }
-  }, [isCameraActive]);
-
-  /**
-   * Pre-builds or retrieves the normal reference memory bank
-   */
-  const ensureMemoryBank = useCallback(async (): Promise<PatchCoreMemoryBank> => {
-    if (!currentProduct) {
-      throw new Error('Please select a manufactured part profile first.');
-    }
-
-    if (referenceImages.length === 0) {
-      throw new Error(
-        `Cannot run AI anomaly inspection: No normal reference images found for "${currentProduct.name}" in users/${currentUser?.uid}/datasets. Please add reference images in the Dataset tab first.`
-      );
-    }
-
-    const cached = memoryBankCacheRef.current.get(currentProduct.id);
-    if (cached && cached.count === referenceImages.length) {
-      return cached.bank;
-    }
-
-    setIsTrainingMemoryBank(true);
-    setTrainingProgress(10);
-    setAnalysisStep('Building normal representation from reference dataset...');
-
-    try {
-      const urls = referenceImages.map((r) => r.dataUrl);
-      const bank = await buildPatchCoreMemoryBank(currentProduct.name, urls, (pct) => {
-        setTrainingProgress(pct);
-      });
-
-      memoryBankCacheRef.current.set(currentProduct.id, {
-        bank,
-        count: referenceImages.length,
-      });
-      setMemoryBank(bank);
-      return bank;
-    } finally {
-      setIsTrainingMemoryBank(false);
-      setTrainingProgress(0);
-    }
-  }, [currentProduct, referenceImages, currentUser?.uid]);
-
-  /**
-   * Autonomous AI Inspection Execution:
-   * Called by the conveyor state machine when a product settles in the Inspection Zone
-   */
-  const handleAutoInspect = useCallback(async (frameDataUrl: string) => {
-    if (!currentProduct || !currentUser) {
-      trackerRef.current.recordInferenceSkipped('No product or operator profile');
-      return;
-    }
-
-    // Capture the cycle token BEFORE the first await so we can detect staleness later.
-    const myToken = ++inspectionTokenRef.current;
-
-    const effectiveThreshold = currentProduct.nominalThreshold ?? threshold ?? 0.50;
-    setIsAnalyzing(true);
-    setAnalysisStep('Analyzing candidate frame...');
-
-    try {
-      const bank = await ensureMemoryBank();
-
-      // Guard: a newer cycle started while we were building the memory bank.
-      if (inspectionTokenRef.current !== myToken) {
-        trackerRef.current.recordInferenceSkipped('Superseded by newer inspection cycle');
-        return;
-      }
-
-      const result = await inspectImageWithPatchCore(frameDataUrl, bank, effectiveThreshold);
-
-      // Guard: the product may have exited during inference – discard stale result.
-      if (inspectionTokenRef.current !== myToken) {
-        trackerRef.current.recordInferenceSkipped('Result arrived after product exited');
-        return;
-      }
-
-      if (result.result === 'INVALID') {
-        trackerRef.current.recordInferenceSkipped(result.qualityIssue || 'Image quality below tolerance');
-        return;
-      }
-
-      // Record completed inspection
-      setSessionInspectedCount((prev) => prev + 1);
-      if (result.result === 'PASS') {
-        setSessionPassCount((prev) => prev + 1);
-        if (audibleAlerts) playIndustrialAlert(true);
-      } else {
-        setSessionFailCount((prev) => prev + 1);
-        if (audibleAlerts) playIndustrialAlert(false);
-      }
-
-      setInspectionResult(result);
-      const nextIndex = sessionInspectedCount + 1;
-      setCurrentLiveResult({
-        result: result.result,
-        anomalyScore: result.anomalyScore,
-        threshold: effectiveThreshold,
-        productIndex: nextIndex,
-        defectRegion: result.suspectedDefectRegion,
-        timestamp: new Date().toLocaleTimeString(),
-      });
-
-      // Persist exactly ONE record to Firestore
-      const recordId = `QC-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.floor(1000 + Math.random() * 9000)}`;
-      const compressedInspectionImage = await compressImageForStorage(frameDataUrl, 800, 0.82);
-      const compressedOverlay = await compressImageForStorage(result.overlayDataUrl, 800, 0.82);
-      const compressedHeatmap = await compressImageForStorage(result.heatmapDataUrl, 400, 0.80);
-
-      // Final staleness guard before the Firestore write.
-      if (inspectionTokenRef.current !== myToken) {
-        trackerRef.current.recordInferenceSkipped('Firestore write cancelled – result superseded');
-        return;
-      }
-
-      const inspectionRecord: InspectionRecord = {
-        id: recordId,
-        userId: currentUser.uid,
-        productId: currentProduct.id,
-        partId: currentProduct.id,
-        productName: currentProduct.name,
-        product_name: currentProduct.name,
-        partSku: currentProduct.sku,
-        timestamp: new Date().toISOString().replace('T', ' ').slice(0, 19),
-        anomalyScore: result.anomalyScore,
-        anomaly_score: result.anomalyScore,
-        threshold: effectiveThreshold,
-        status: result.result,
-        result: result.result,
-        confidenceScore: Number((1 - result.anomalyScore).toFixed(2)),
-        imageUrl: compressedInspectionImage,
-        imageDataUrl: compressedInspectionImage,
-        image_path: `Conveyor_Frame_${currentProduct.sku}_#${nextIndex}.jpg`,
-        heatmapUrl: compressedHeatmap,
-        overlayUrl: compressedOverlay,
-        suspectedDefectRegion: result.suspectedDefectRegion,
-        defectLocation: result.result === 'FAIL' 
-          ? `(${result.maxAnomalyCoord.x}px, ${result.maxAnomalyCoord.y}px)` 
-          : '',
-        defectType: result.result === 'FAIL' ? 'Surface Anomaly' : 'Conformant',
-        inferenceTimeMs: result.inferenceTimeMs,
-        batchNumber: `BATCH-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`,
-        operator: currentUser.displayName || 'Operator',
-        inspectionLine: currentProduct.activeLine || 'Line 01 - Optical Bench',
-        source: 'live_camera',
-      };
-
-      onRecordInspection(inspectionRecord);
-      setLastSavedId(recordId);
-
-      // Notify tracker that inference finished so it transitions to WAIT_FOR_PRODUCT_EXIT
-      trackerRef.current.recordInferenceComplete(result.inferenceTimeMs);
-    } catch (err: any) {
-      console.error('[LiveConveyor] Inspection failure:', err);
-      trackerRef.current.recordInferenceSkipped(err.message || 'Inspection error');
-    } finally {
-      setIsAnalyzing(false);
-      setAnalysisStep('');
-    }
-  }, [currentProduct, currentUser, threshold, audibleAlerts, ensureMemoryBank, onRecordInspection, sessionInspectedCount]);
-
-  /**
-   * Start Autonomous Live Inspection Loop
-   */
-  const handleStartLiveInspection = async () => {
-    if (!currentProduct) {
-      setCameraError('Please select a product part profile first.');
-      return;
-    }
-
-    if (referenceImages.length === 0) {
-      setCameraError(
-        `Cannot start live inspection: No normal reference images uploaded for "${currentProduct.name}". Please add normal images in the Dataset tab first.`
-      );
-      return;
-    }
-
-    const cameraStarted = await startCamera();
-    if (!cameraStarted) return;
-
-    // Connect tracker inspection callback
-    trackerRef.current.setInspectionHandler(handleAutoInspect);
-    trackerRef.current.setRoi(roiConfig);
-    trackerRef.current.setFps(liveInspectionFps);
-    setIsLiveInspectionRunning(true);
-    setCameraError(null);
-
-    // Frame sampling loop at LIVE_INSPECTION_FPS
-    if (loopIntervalRef.current) clearInterval(loopIntervalRef.current);
-
-    loopIntervalRef.current = window.setInterval(async () => {
-      if (!videoRef.current || videoRef.current.readyState < 2) return;
-
-      trackerRef.current.markCameraFrame();
-      const tickResult = await trackerRef.current.processFrameTick(videoRef.current);
-
-      setConveyorState(tickResult.state);
-      setLiveDiagnostics(tickResult.diagnostics);
-    }, Math.round(1000 / liveInspectionFps));
-  };
-
-  /**
-   * Stop Live Inspection Loop
-   */
-  const handleStopLiveInspection = () => {
-    if (loopIntervalRef.current) {
-      clearInterval(loopIntervalRef.current);
-      loopIntervalRef.current = null;
-    }
-
-    trackerRef.current.cleanup();
-    setIsLiveInspectionRunning(false);
-    setConveyorState('IDLE');
-    setAnalysisStep('');
-  };
-
-  /**
-   * Change ROI Preset (Standard, Compact, Wide)
-   */
-  const handleSetRoiPreset = (preset: 'standard' | 'compact' | 'wide') => {
-    setRoiPreset(preset);
-    let newRoi: RoiNormalized;
-    if (preset === 'compact') {
-      newRoi = { x: 0.25, y: 0.25, width: 0.50, height: 0.50 };
-    } else if (preset === 'wide') {
-      newRoi = { x: 0.08, y: 0.08, width: 0.84, height: 0.84 };
-    } else {
-      newRoi = { ...DEFAULT_ROI_NORMALIZED };
-    }
-    setRoiConfig(newRoi);
-    trackerRef.current.setRoi(newRoi);
-  };
-
-  /**
-   * Change Sampling FPS
-   */
-  const handleChangeFps = (fps: number) => {
-    setLiveInspectionFps(fps);
-    trackerRef.current.setFps(fps);
-    if (isLiveInspectionRunning) {
-      // Re-arm interval with new FPS
-      if (loopIntervalRef.current) clearInterval(loopIntervalRef.current);
-      loopIntervalRef.current = window.setInterval(async () => {
-        if (!videoRef.current || videoRef.current.readyState < 2) return;
-        trackerRef.current.markCameraFrame();
-        const tickResult = await trackerRef.current.processFrameTick(videoRef.current);
-        setConveyorState(tickResult.state);
-        setLiveDiagnostics(tickResult.diagnostics);
-      }, Math.round(1000 / fps));
-    }
-  };
-
-  /**
-   * Cleanup on unmount
-   */
-  useEffect(() => {
-    return () => {
-      if (loopIntervalRef.current) {
-        clearInterval(loopIntervalRef.current);
-      }
-      stopCamera();
-    };
-  }, [stopCamera]);
-
-  /**
-   * Manual Test Mode Image Upload
-   */
-  const handleManualFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Handle File Selection or Drop
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (file) {
+      processSelectedFile(file);
+    }
+  };
+
+  const processSelectedFile = (file: File) => {
+    setImageFileName(file.name);
+    const sizeKb = (file.size / 1024).toFixed(1) + ' KB';
 
     const reader = new FileReader();
     reader.onload = (event) => {
-      const result = event.target?.result as string;
-      if (result) {
-        setCapturedImage(result);
+      const dataUrl = event.target?.result as string;
+      setUploadedImage(dataUrl);
+      setMatchResult(null);
+      setRenderedHeatmapUrl(null);
+      setRenderedOverlayUrl(null);
+      setActiveViewMode('original');
+
+      const img = new Image();
+      img.onload = () => {
         setImageMeta({
-          source: 'upload',
-          name: file.name,
-          timestamp: new Date().toLocaleTimeString(),
+          resolution: `${img.width} × ${img.height} px`,
+          size: sizeKb,
         });
-        setInspectionResult(null);
-        setActiveViewMode('original');
-      }
+      };
+      img.src = dataUrl;
     };
     reader.readAsDataURL(file);
+  };
+
+  // Run Image-Specific Shape Match
+  const handleAnalyseShape = async () => {
+    if (!uploadedImage) return;
+
+    setIsAnalyzing(true);
+    setAnalysisStep('Preprocessing image geometry...');
+
+    await new Promise((r) => setTimeout(r, 200));
+    setAnalysisStep('Matching canonical shape signatures...');
+
+    await new Promise((r) => setTimeout(r, 300));
+    const result = await matchCanonicalWasher(uploadedImage);
+
+    // Generate heatmap visualization canvases
+    const imgObj = new Image();
+    imgObj.crossOrigin = 'anonymous';
+    imgObj.onload = () => {
+      const overlayUrl = renderCanonicalHeatmapCanvas(result.heatmapMatrix, 'overlay', imgObj);
+      const heatmapUrl = renderCanonicalHeatmapCanvas(result.heatmapMatrix, 'heatmap');
+      setRenderedOverlayUrl(overlayUrl);
+      setRenderedHeatmapUrl(heatmapUrl);
+    };
+    imgObj.src = uploadedImage;
+
+    setMatchResult(result);
+    setIsAnalyzing(false);
+
+    // Update stats and play sound
+    if (result.status === 'PASS') {
+      setSessionInspected((prev) => prev + 1);
+      setSessionPass((prev) => prev + 1);
+      if (audibleAlerts) playIndustrialAlert(true);
+    } else if (result.status === 'FAIL') {
+      setSessionInspected((prev) => prev + 1);
+      setSessionFail((prev) => prev + 1);
+      if (audibleAlerts) playIndustrialAlert(false);
+    }
+
+    // Save history record
+    if (currentProduct && result.status !== 'UNKNOWN') {
+      const record: InspectionRecord = {
+        id: 'insp_' + Date.now(),
+        timestamp: new Date().toISOString(),
+        partName: currentProduct.name,
+        productName: currentProduct.name,
+        product_name: currentProduct.name,
+        inspectionLine: 'Upload Inspection',
+        status: result.status === 'PASS' ? 'PASS' : 'FAIL',
+        result: result.status === 'PASS' ? 'PASS' : 'FAIL',
+        confidenceScore: result.confidence,
+        anomalyScore: result.anomalyPercentage,
+        anomaly_score: result.anomalyPercentage,
+        threshold: 0.35,
+        defectType: result.defectType,
+        imageUrl: uploadedImage,
+        heatmapUrl: renderedHeatmapUrl || undefined,
+        source: 'manual_upload',
+      };
+      onRecordInspection(record);
+    }
+  };
+
+  const clearUploadedImage = () => {
+    setUploadedImage(null);
+    setImageFileName('');
+    setImageMeta(null);
+    setMatchResult(null);
+    setRenderedHeatmapUrl(null);
+    setRenderedOverlayUrl(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  /**
-   * Manual Test Mode Inspection Run
-   */
-  const handleRunManualInspection = async () => {
-    if (!capturedImage) {
-      setCameraError('Please upload an image first.');
-      return;
-    }
-    if (!currentProduct) {
-      setCameraError('Please select a product first.');
-      return;
-    }
-    const effectiveThreshold = currentProduct.nominalThreshold ?? threshold ?? 0.50;
-    setIsAnalyzing(true);
-    setAnalysisStep('Analyzing test frame...');
+  const yieldRate = sessionInspected > 0 ? ((sessionPass / sessionInspected) * 100).toFixed(1) : '100.0';
 
-    try {
-      const bank = await ensureMemoryBank();
-      const result = await inspectImageWithPatchCore(capturedImage, bank, effectiveThreshold);
-      setInspectionResult(result);
-      setActiveViewMode('overlay');
-
-      if (audibleAlerts && result.result !== 'INVALID') {
-        playIndustrialAlert(result.result === 'PASS');
-      }
-
-      if (result.result !== 'INVALID') {
-        const recordId = `QC-MANUAL-${Date.now().toString().slice(-6)}`;
-        onRecordInspection({
-          id: recordId,
-          userId: currentUser?.uid,
-          productId: currentProduct.id,
-          partId: currentProduct.id,
-          productName: currentProduct.name,
-          product_name: currentProduct.name,
-          partSku: currentProduct.sku,
-          timestamp: new Date().toISOString().replace('T', ' ').slice(0, 19),
-          anomalyScore: result.anomalyScore,
-          anomaly_score: result.anomalyScore,
-          threshold: effectiveThreshold,
-          status: result.result,
-          result: result.result,
-          confidenceScore: Number((1 - result.anomalyScore).toFixed(2)),
-          imageUrl: capturedImage,
-          imageDataUrl: capturedImage,
-          image_path: imageMeta?.name || 'Manual_Test_Image.jpg',
-          heatmapUrl: result.heatmapDataUrl,
-          overlayUrl: result.overlayDataUrl,
-          suspectedDefectRegion: result.suspectedDefectRegion,
-          defectLocation: result.result === 'FAIL' ? `(${result.maxAnomalyCoord.x}px, ${result.maxAnomalyCoord.y}px)` : '',
-          defectType: result.result === 'FAIL' ? 'Surface Anomaly' : 'Conformant',
-          inferenceTimeMs: result.inferenceTimeMs,
-          source: 'manual_upload',
-        });
-        setLastSavedId(recordId);
-      }
-    } catch (err: any) {
-      setCameraError(err.message || 'Inspection failed');
-    } finally {
-      setIsAnalyzing(false);
-      setAnalysisStep('');
-    }
-  };
-
-  const effectiveThreshold = currentProduct?.nominalThreshold ?? threshold ?? 0.50;
-  const yieldPct = sessionInspectedCount > 0 ? ((sessionPassCount / sessionInspectedCount) * 100).toFixed(1) : '100.0';
-
-  return (
-    <div className="space-y-6">
-      
-      {/* Top Station Bar: Part Selector & Station Header */}
-      <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-2 text-xs font-mono text-slate-500 mb-1">
-            <span className="flex items-center gap-1.5 text-blue-600 font-semibold">
-              <span className="w-2 h-2 rounded-full bg-blue-600" />
-              CONTINUOUS INDUSTRIAL OPTICAL STATION
-            </span>
-            <span>·</span>
-            <span>LINE CONVEYOR-01</span>
-            <span>·</span>
-            <span className="text-slate-400">Autonomous Edge AI</span>
-          </div>
-          <h2 className="text-lg font-bold text-slate-900 tracking-tight font-mono">
-            Live Conveyor-Belt Optical Chamber
-          </h2>
-          <p className="text-xs text-slate-500 mt-0.5">
-            Continuous optical stream monitoring with automated product presence detection and zero-click defect localization.
+  if (!products || products.length === 0) {
+    return (
+      <div className="max-w-4xl mx-auto py-12 px-4 text-center">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-10 shadow-2xl">
+          <FolderGit2 className="w-16 h-16 text-blue-400 mx-auto mb-4" />
+          <h2 className="text-2xl font-bold text-white mb-2">No Product Configured</h2>
+          <p className="text-slate-400 max-w-md mx-auto mb-6">
+            Please create a product in the Dataset manager before running shape inspection.
           </p>
-        </div>
-
-        {/* Product Part Dropdown Selector */}
-        <div className="flex items-center gap-3">
-          <label className="text-xs font-mono font-medium text-slate-600 whitespace-nowrap">
-            Inspection Part:
-          </label>
-          {products.length === 0 ? (
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-mono text-slate-400 italic">No products yet</span>
-              {onCreateProduct && (
-                <button
-                  type="button"
-                  onClick={onCreateProduct}
-                  className="px-2.5 py-1 text-xs font-mono font-medium text-blue-600 bg-blue-50 hover:bg-blue-100 rounded border border-blue-200 transition-colors"
-                >
-                  + Register Part
-                </button>
-              )}
-            </div>
-          ) : (
-            <select
-              value={currentProduct?.id || ''}
-              onChange={(e) => {
-                const selected = products.find((p) => p.id === e.target.value);
-                if (selected) onSelectProduct(selected);
-              }}
-              className="bg-slate-50 border border-slate-300 text-slate-800 text-xs font-mono px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent font-medium cursor-pointer"
+          {onCreateProduct && (
+            <button
+              onClick={onCreateProduct}
+              className="px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-xl transition shadow-lg shadow-blue-500/20"
             >
-              {products.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name} ({p.sku})
-                </option>
-              ))}
-            </select>
+              Configure First Product
+            </button>
           )}
         </div>
       </div>
+    );
+  }
 
-      {/* Mode Tabs: LIVE CONVEYOR (Default) vs MANUAL TEST MODE */}
-      <div className="flex items-center justify-between border-b border-slate-200 pb-2">
-        <div className="flex items-center gap-2 font-mono text-xs">
-          <button
-            type="button"
-            onClick={() => setActiveTab('conveyor')}
-            className={`px-4 py-2 rounded-lg font-bold flex items-center gap-2 transition-all cursor-pointer ${
-              activeTab === 'conveyor'
-                ? 'bg-blue-600 text-white shadow-xs'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
-            }`}
-          >
-            <Video className="w-4 h-4" />
-            <span>LIVE CONVEYOR INSPECTION</span>
-            {isLiveInspectionRunning && (
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse ml-1" />
-            )}
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveTab('manual')}
-            className={`px-4 py-2 rounded-lg font-semibold flex items-center gap-2 transition-all cursor-pointer ${
-              activeTab === 'manual'
-                ? 'bg-slate-900 text-white shadow-xs'
-                : 'text-slate-500 hover:text-slate-900 hover:bg-slate-100'
-            }`}
-          >
-            <Upload className="w-4 h-4" />
-            <span>MANUAL TEST MODE (OFFLINE / DEBUG)</span>
-          </button>
+  return (
+    <div className="max-w-6xl mx-auto space-y-6 pb-12">
+      {/* Header bar & Product Selector */}
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
+        <div>
+          <div className="flex items-center gap-3">
+            <ShieldCheck className="w-7 h-7 text-blue-400" />
+            <h1 className="text-2xl font-extrabold text-white tracking-tight">Product Shape Inspection</h1>
+          </div>
+          <p className="text-sm text-slate-400 mt-1">
+            Image-specific geometric shape deformation classifier for washer quality assurance
+          </p>
         </div>
 
-        <div className="hidden sm:flex items-center gap-3 text-xs font-mono text-slate-500">
-          <span>Tolerance: <strong className="text-slate-800">{effectiveThreshold.toFixed(2)}</strong></span>
-          <span>·</span>
-          <span>References: <strong className="text-slate-800">{referenceImages.length}</strong></span>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-slate-400 uppercase tracking-wider font-semibold">Active Model:</span>
+          <select
+            value={currentProduct?.id || ''}
+            onChange={(e) => {
+              const p = products.find((prod) => prod.id === e.target.value);
+              if (p) onSelectProduct(p);
+            }}
+            className="bg-slate-800 border border-slate-700 text-white text-sm rounded-xl px-4 py-2 font-medium focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            {products.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name} ({p.sku})
+              </option>
+            ))}
+          </select>
         </div>
       </div>
 
-      {/* Camera & Permission Error Alert Banner */}
-      {cameraError && (
-        <div className="p-4 bg-rose-50 border border-rose-200 rounded-xl text-xs font-mono text-rose-800 flex items-start justify-between gap-3 shadow-xs animate-fadeIn">
-          <div className="flex items-start gap-2.5">
-            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-            <div>
-              <div className="font-bold text-rose-900 mb-0.5">Optical Sensor Warning</div>
-              <div className="leading-relaxed">{cameraError}</div>
+      {/* Session Performance Stats */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 flex items-center gap-4">
+          <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg text-blue-400">
+            <Activity className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="text-xs text-slate-400 uppercase font-medium">Inspected</div>
+            <div className="text-xl font-bold text-white">{sessionInspected}</div>
+          </div>
+        </div>
+
+        <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 flex items-center gap-4">
+          <div className="p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-emerald-400">
+            <CheckCircle2 className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="text-xs text-slate-400 uppercase font-medium">Passed</div>
+            <div className="text-xl font-bold text-emerald-400">{sessionPass}</div>
+          </div>
+        </div>
+
+        <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 flex items-center gap-4">
+          <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-lg text-rose-400">
+            <XCircle className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="text-xs text-slate-400 uppercase font-medium">Defects</div>
+            <div className="text-xl font-bold text-rose-400">{sessionFail}</div>
+          </div>
+        </div>
+
+        <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 flex items-center gap-4">
+          <div className="p-3 bg-indigo-500/10 border border-indigo-500/20 rounded-lg text-indigo-400">
+            <TrendingUp className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="text-xs text-slate-400 uppercase font-medium">Pass Rate</div>
+            <div className="text-xl font-bold text-indigo-300">{yieldRate}%</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Main Inspection Section: Upload & Analysis */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        {/* Upload & Controls Panel */}
+        <div className="lg:col-span-5 space-y-6">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-5">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-bold text-white flex items-center gap-2">
+                <Upload className="w-5 h-5 text-blue-400" />
+                Upload Inspection Image
+              </h2>
+              {uploadedImage && (
+                <button
+                  onClick={clearUploadedImage}
+                  className="text-xs text-rose-400 hover:text-rose-300 flex items-center gap-1 font-medium transition"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Remove
+                </button>
+              )}
+            </div>
+
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleFileChange}
+              accept="image/*"
+              className="hidden"
+            />
+
+            {!uploadedImage ? (
+              <div
+                onClick={() => fileInputRef.current?.click()}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (e.dataTransfer.files?.[0]) processSelectedFile(e.dataTransfer.files[0]);
+                }}
+                className="border-2 border-dashed border-slate-700 hover:border-blue-500/60 bg-slate-950/50 hover:bg-blue-950/20 rounded-xl p-8 text-center cursor-pointer transition group"
+              >
+                <div className="w-14 h-14 bg-slate-800 group-hover:bg-blue-600/20 text-slate-400 group-hover:text-blue-400 rounded-2xl flex items-center justify-center mx-auto mb-4 transition">
+                  <ImageIcon className="w-7 h-7" />
+                </div>
+                <div className="text-white font-semibold mb-1">Click or drag product image here</div>
+                <div className="text-xs text-slate-400">Supports PNG, JPG, BMP format washer inspection photos</div>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="relative aspect-square w-full bg-slate-950 rounded-xl overflow-hidden border border-slate-800 flex items-center justify-center p-2">
+                  <img
+                    src={uploadedImage}
+                    alt="Uploaded inspection item"
+                    className="max-h-full max-w-full object-contain rounded-lg shadow-lg"
+                  />
+                </div>
+
+                <div className="bg-slate-950/80 rounded-xl p-3 border border-slate-800/80 text-xs space-y-1.5 text-slate-300">
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">File Name:</span>
+                    <span className="font-mono text-white truncate max-w-[200px]">{imageFileName}</span>
+                  </div>
+                  {imageMeta && (
+                    <>
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Resolution:</span>
+                        <span className="font-mono text-white">{imageMeta.resolution}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">File Size:</span>
+                        <span className="font-mono text-white">{imageMeta.size}</span>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                <button
+                  onClick={handleAnalyseShape}
+                  disabled={isAnalyzing}
+                  className="w-full py-3.5 px-6 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold rounded-xl transition shadow-lg shadow-blue-600/25 flex items-center justify-center gap-2.5 disabled:opacity-50"
+                >
+                  {isAnalyzing ? (
+                    <>
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                      <span>{analysisStep}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-5 h-5" />
+                      <span>Analyse Shape</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Demo Canonical Conditions Card */}
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-3">
+            <div className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+              <Info className="w-4 h-4 text-blue-400" />
+              Demo Canonical Conditions
+            </div>
+            <div className="text-xs text-slate-300 space-y-2">
+              <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800 flex items-center justify-between">
+                <span className="font-semibold text-emerald-400">1. Normal Washer</span>
+                <span className="text-slate-400 font-mono">PASS</span>
+              </div>
+              <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800 flex items-center justify-between">
+                <span className="font-semibold text-rose-400">2. Two Inner Punches</span>
+                <span className="text-slate-400 font-mono">FAIL</span>
+              </div>
+              <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800 flex items-center justify-between">
+                <span className="font-semibold text-amber-400">3. Outer Edge Deformation</span>
+                <span className="text-slate-400 font-mono">FAIL</span>
+              </div>
             </div>
           </div>
-          <button
-            onClick={() => setCameraError(null)}
-            className="text-rose-500 hover:text-rose-800 text-xs font-bold px-2 py-1 rounded hover:bg-rose-100 transition-colors cursor-pointer"
-          >
-            Dismiss
-          </button>
         </div>
-      )}
 
-      {/* Main Two-Column Layout */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        
-        {/* Left Column (8 cols): Large Continuous Live Camera Viewport Area */}
-        <div className="lg:col-span-8 space-y-4">
-          
-          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-xs">
-            
-            {/* Viewport Header with Live Status & Mode Badge */}
-            <div className="px-4 py-3 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
-              <div className="flex items-center gap-2">
-                <div className={`w-2.5 h-2.5 rounded-full ${
-                  isLiveInspectionRunning ? 'bg-emerald-400 animate-ping' : isCameraActive ? 'bg-blue-400' : 'bg-slate-500'
-                }`} />
-                <span className="font-bold text-white tracking-wide">
-                  {activeTab === 'conveyor' ? 'CONVEYOR OPTICAL FEED' : 'MANUAL TEST FEED'}
-                </span>
-
-                {isLiveInspectionRunning && (
-                  <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 text-[10px] font-bold border border-emerald-500/30 flex items-center gap-1.5 ml-1">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                    AUTONOMOUS INSPECTION ACTIVE
-                  </span>
-                )}
-              </div>
-
-              {/* View Mode Tabs for Manual Mode or Result Overlays */}
-              <div className="flex items-center gap-1 bg-slate-800/80 p-0.5 rounded-lg border border-slate-700 text-[10px]">
-                <button
-                  type="button"
-                  onClick={() => setActiveViewMode('live')}
-                  className={`px-2.5 py-1 rounded transition-colors ${
-                    activeViewMode === 'live' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  Live Feed
-                </button>
-                {inspectionResult && (
-                  <>
-                    {capturedImage && (
-                      <button
-                        type="button"
-                        onClick={() => setActiveViewMode('original')}
-                        className={`px-2.5 py-1 rounded transition-colors ${
-                          activeViewMode === 'original' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
-                        }`}
-                      >
-                        Original
-                      </button>
-                    )}
-                    {inspectionResult.overlayDataUrl && (
-                      <button
-                        type="button"
-                        onClick={() => setActiveViewMode('overlay')}
-                        className={`px-2.5 py-1 rounded transition-colors ${
-                          activeViewMode === 'overlay' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
-                        }`}
-                      >
-                        Overlay
-                      </button>
-                    )}
-                    {inspectionResult.heatmapDataUrl && (
-                      <button
-                        type="button"
-                        onClick={() => setActiveViewMode('heatmap')}
-                        className={`px-2.5 py-1 rounded transition-colors ${
-                          activeViewMode === 'heatmap' ? 'bg-blue-600 text-white font-bold' : 'text-slate-400 hover:text-white'
-                        }`}
-                      >
-                        Heatmap
-                      </button>
-                    )}
-                  </>
-                )}
-              </div>
-            </div>
-
-            {/* Viewport Display Chamber */}
-            <div className="relative aspect-video w-full bg-slate-950 flex items-center justify-center overflow-hidden select-none">
-              
-              {/* Continuous Video Feed */}
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                className={`w-full h-full object-cover transition-opacity duration-300 ${
-                  isCameraActive && activeViewMode === 'live' ? 'opacity-100' : 'opacity-0 hidden'
-                }`}
-              />
-
-              {/* Image Overlays (When inspecting or reviewing results) */}
-              {activeViewMode === 'overlay' && inspectionResult && (
-                <img
-                  src={inspectionResult.overlayDataUrl}
-                  alt="Inspection Overlay"
-                  className="w-full h-full object-contain"
-                />
-              )}
-
-              {activeViewMode === 'heatmap' && inspectionResult && (
-                <img
-                  src={inspectionResult.heatmapDataUrl}
-                  alt="Anomaly Heatmap"
-                  className="w-full h-full object-contain"
-                />
-              )}
-
-              {activeViewMode === 'original' && capturedImage && (
-                <img
-                  src={capturedImage}
-                  alt="Captured Frame"
-                  className="w-full h-full object-contain"
-                />
-              )}
-
-              {/* Camera Standby Indicator */}
-              {!isCameraActive && !capturedImage && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center text-slate-400 space-y-3">
-                  <div className="w-16 h-16 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-slate-500 shadow-inner">
-                    <VideoOff className="w-8 h-8" />
+        {/* Results & Heatmap Display Panel */}
+        <div className="lg:col-span-7 space-y-6">
+          {matchResult ? (
+            <div className="space-y-6">
+              {/* PASS / FAIL / UNMATCHED Status Card */}
+              {matchResult.status === 'PASS' && (
+                <div className="bg-emerald-950/40 border border-emerald-500/40 rounded-2xl p-6 shadow-2xl flex items-start gap-5">
+                  <div className="p-3 bg-emerald-500/20 border border-emerald-500/40 rounded-2xl text-emerald-400">
+                    <CheckCircle2 className="w-10 h-10" />
                   </div>
-                  <div>
-                    <div className="text-sm font-bold font-mono text-slate-200">
-                      Conveyor Optical Chamber Standby
+                  <div className="space-y-1">
+                    <div className="inline-block px-3 py-1 bg-emerald-500/20 text-emerald-300 font-black rounded-full text-xs uppercase tracking-wider mb-1">
+                      PASS — GEOMETRY CONFORMS
                     </div>
-                    <p className="text-xs text-slate-500 max-w-sm mt-1 font-mono">
-                      Click &quot;Start Live Inspection&quot; to begin continuous automated conveyor tracking.
+                    <h2 className="text-2xl font-black text-white">{matchResult.title}</h2>
+                    <p className="text-sm text-emerald-200/90">{matchResult.description}</p>
+                    <div className="pt-2 flex items-center gap-4 text-xs text-slate-400 font-mono">
+                      <span>Shape Deformation: <strong className="text-emerald-400">{matchResult.anomalyPercentage.toFixed(1)}%</strong></span>
+                      <span>Confidence: <strong className="text-slate-200">{(matchResult.confidence * 100).toFixed(0)}%</strong></span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {matchResult.status === 'FAIL' && (
+                <div className="bg-rose-950/40 border border-rose-500/40 rounded-2xl p-6 shadow-2xl flex items-start gap-5">
+                  <div className="p-3 bg-rose-500/20 border border-rose-500/40 rounded-2xl text-rose-400">
+                    <XCircle className="w-10 h-10" />
+                  </div>
+                  <div className="space-y-1">
+                    <div className="inline-block px-3 py-1 bg-rose-500/20 text-rose-300 font-black rounded-full text-xs uppercase tracking-wider mb-1">
+                      FAIL — {matchResult.defectType}
+                    </div>
+                    <h2 className="text-2xl font-black text-white">{matchResult.title}</h2>
+                    <p className="text-sm text-rose-200/90">{matchResult.description}</p>
+                    <div className="pt-2 flex items-center gap-4 text-xs text-slate-400 font-mono">
+                      <span>Deformation Severity: <strong className="text-rose-400">{matchResult.anomalyPercentage.toFixed(1)}%</strong></span>
+                      <span>Confidence: <strong className="text-slate-200">{(matchResult.confidence * 100).toFixed(0)}%</strong></span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {matchResult.status === 'UNKNOWN' && (
+                <div className="bg-amber-950/40 border border-amber-500/40 rounded-2xl p-6 shadow-2xl flex items-start gap-5">
+                  <div className="p-3 bg-amber-500/20 border border-amber-500/40 rounded-2xl text-amber-400">
+                    <AlertTriangle className="w-10 h-10" />
+                  </div>
+                  <div className="space-y-1">
+                    <div className="inline-block px-3 py-1 bg-amber-500/20 text-amber-300 font-black rounded-full text-xs uppercase tracking-wider mb-1">
+                      UNMATCHED TEMPLATE
+                    </div>
+                    <h2 className="text-2xl font-black text-white">Unmatched Inspection Image</h2>
+                    <p className="text-sm text-amber-200/90">{matchResult.description}</p>
+                    <p className="text-xs text-slate-400 pt-1">
+                      Please upload a valid washer inspection photo matching one of the three canonical conditions.
                     </p>
                   </div>
                 </div>
               )}
 
-              {/* CONVEYOR INSPECTION ZONE RETICLE (Active in Live Feed) */}
-              {isCameraActive && activeViewMode === 'live' && (
-                <div
-                  className="absolute pointer-events-none transition-all duration-300"
-                  style={{
-                    left: `${roiConfig.x * 100}%`,
-                    top: `${roiConfig.y * 100}%`,
-                    width: `${roiConfig.width * 100}%`,
-                    height: `${roiConfig.height * 100}%`,
-                  }}
-                >
-                  {/* Dynamic Reticle Border depending on State */}
-                  <div className={`w-full h-full rounded-lg relative transition-all duration-200 border-2 ${
-                    conveyorState === 'IDLE'
-                      ? 'border-dashed border-blue-400/40'
-                      : conveyorState === 'PRODUCT_DETECTED' || conveyorState === 'ENTERING'
-                      ? 'border-amber-400 animate-pulse shadow-[0_0_15px_rgba(251,191,36,0.3)]'
-                      : conveyorState === 'READY_FOR_INSPECTION' || conveyorState === 'INSPECTING'
-                      ? 'border-cyan-400 animate-pulse shadow-[0_0_20px_rgba(34,211,238,0.4)]'
-                      : currentLiveResult?.result === 'FAIL'
-                      ? 'border-rose-500 shadow-[0_0_25px_rgba(244,63,94,0.5)]'
-                      : 'border-emerald-400 shadow-[0_0_20px_rgba(52,211,153,0.4)]'
-                  }`}>
-                    {/* Industrial Corner Accents */}
-                    <div className="absolute -top-1 -left-1 w-5 h-5 border-t-4 border-l-4 border-inherit" />
-                    <div className="absolute -top-1 -right-1 w-5 h-5 border-t-4 border-r-4 border-inherit" />
-                    <div className="absolute -bottom-1 -left-1 w-5 h-5 border-b-4 border-l-4 border-inherit" />
-                    <div className="absolute -bottom-1 -right-1 w-5 h-5 border-b-4 border-r-4 border-inherit" />
+              {/* View Mode Tabs (Original / Overlay / Heatmap) */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-4">
+                  <h3 className="text-base font-bold text-white flex items-center gap-2">
+                    <Layers className="w-5 h-5 text-blue-400" />
+                    Shape Deformation Visualization
+                  </h3>
 
-                    {/* Center Crosshair */}
-                    <div className="absolute inset-0 flex items-center justify-center opacity-30">
-                      <div className="w-8 h-0.5 bg-white" />
-                      <div className="h-8 w-0.5 bg-white -ml-4" />
-                    </div>
-
-                    {/* Inspection Zone Label */}
-                    <div className="absolute -top-6 left-1 bg-slate-900/80 px-2 py-0.5 rounded text-[10px] font-mono text-blue-300 font-bold tracking-wider backdrop-blur-xs flex items-center gap-1.5">
-                      <Box className="w-3 h-3 text-blue-400" />
-                      <span>INSPECTION ZONE</span>
-                    </div>
-
-                    {/* Occupancy Indicator in Corner */}
-                    <div className="absolute bottom-2 right-2 bg-slate-950/80 px-2 py-0.5 rounded text-[10px] font-mono text-slate-300 font-semibold backdrop-blur-xs">
-                      Occupancy: {liveDiagnostics.roiOccupancy}%
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* LIVE CONVEYOR FLOATING HUD (Top Left & Top Right) */}
-              {isCameraActive && activeViewMode === 'live' && (
-                <>
-                  <div className="absolute top-3 left-3 flex flex-col gap-1 font-mono text-[10px] pointer-events-none">
-                    <span className="px-2.5 py-1 rounded bg-slate-900/80 text-white backdrop-blur-xs flex items-center gap-1.5 border border-slate-700/60 shadow-sm">
-                      <span className={`w-2 h-2 rounded-full ${
-                        conveyorState === 'IDLE' ? 'bg-slate-400' : 'bg-emerald-400 animate-ping'
-                      }`} />
-                      <span>STATE: <strong>{conveyorState}</strong></span>
-                    </span>
-                  </div>
-
-                  <div className="absolute top-3 right-3 flex items-center gap-2 font-mono text-[10px] pointer-events-none">
-                    <span className="px-2 py-1 rounded bg-slate-900/80 text-slate-300 backdrop-blur-xs border border-slate-700/60">
-                      Cam: <strong className="text-white">{liveDiagnostics.cameraFps} FPS</strong>
-                    </span>
-                    <span className="px-2 py-1 rounded bg-slate-900/80 text-slate-300 backdrop-blur-xs border border-slate-700/60">
-                      Proc: <strong className="text-white">{liveDiagnostics.processingFps} FPS</strong>
-                    </span>
-                    {liveDiagnostics.isBottleneck && (
-                      <span className="px-2 py-1 rounded bg-rose-600/90 text-white font-bold animate-pulse backdrop-blur-xs border border-rose-400">
-                        PROCESSING BOTTLENECK
-                      </span>
-                    )}
-                  </div>
-                </>
-              )}
-
-              {/* REAL-TIME PRODUCT RESULT CARD OVERLAY (Floats in Viewport) */}
-              {isCameraActive && activeViewMode === 'live' && (
-                <div className="absolute bottom-3 left-3 right-3 pointer-events-none flex justify-center">
-                  {isAnalyzing ? (
-                    <div className="bg-slate-900/90 border border-cyan-500/50 rounded-xl px-5 py-3 text-white font-mono text-xs shadow-2xl backdrop-blur-md flex items-center gap-3 animate-pulse">
-                      <Loader2 className="w-5 h-5 text-cyan-400 animate-spin" />
-                      <div>
-                        <div className="font-bold text-cyan-300">CURRENT PRODUCT: Inspecting...</div>
-                        <div className="text-[11px] text-slate-400">Comparing multi-scale patch vectors against normal baseline...</div>
-                      </div>
-                    </div>
-                  ) : currentLiveResult ? (
-                    <div className={`rounded-xl px-4 py-3 font-mono text-xs shadow-2xl backdrop-blur-md border-2 transition-all ${
-                      currentLiveResult.result === 'PASS'
-                        ? 'bg-slate-950/90 border-emerald-500 text-white'
-                        : 'bg-slate-950/90 border-rose-500 text-white'
-                    }`}>
-                      {/* Top row: verdict + timestamp */}
-                      <div className="flex items-center justify-between gap-4 mb-2">
-                        <div className="flex items-center gap-2.5">
-                          <div className={`w-7 h-7 rounded-md flex items-center justify-center shrink-0 ${
-                            currentLiveResult.result === 'PASS' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
-                          }`}>
-                            {currentLiveResult.result === 'PASS' ? (
-                              <CheckCircle2 className="w-5 h-5" />
-                            ) : (
-                              <XCircle className="w-5 h-5" />
-                            )}
-                          </div>
-                          <div>
-                            <div className={`text-sm font-bold ${
-                              currentLiveResult.result === 'PASS' ? 'text-emerald-400' : 'text-rose-400'
-                            }`}>
-                              {currentLiveResult.result === 'PASS' ? 'PASS ✓' : 'FAIL ✗'}
-                              <span className="text-[11px] font-normal text-slate-400 ml-2">Product #{currentLiveResult.productIndex}</span>
-                            </div>
-                            {currentLiveResult.result === 'FAIL' && (
-                              <div className="text-[10px] text-rose-300 mt-0.5">Anomaly score exceeded rejection threshold.</div>
-                            )}
-                          </div>
-                        </div>
-                        <div className="text-right text-[10px] text-slate-400 shrink-0">
-                          <div>{currentLiveResult.timestamp}</div>
-                        </div>
-                      </div>
-                      {/* Score bar */}
-                      <div className="space-y-1">
-                        <div className="flex justify-between text-[10px] text-slate-400">
-                          <span>Anomaly Score</span>
-                          <span className="tabular-nums">
-                            <strong className={currentLiveResult.result === 'FAIL' ? 'text-rose-400' : 'text-emerald-400'}>
-                              {currentLiveResult.anomalyScore.toFixed(3)}
-                            </strong>
-                            {' '}/ limit {currentLiveResult.threshold.toFixed(2)}
-                          </span>
-                        </div>
-                        <div className="relative h-1.5 rounded-full bg-slate-700 overflow-hidden">
-                          <div
-                            className={`absolute inset-y-0 left-0 rounded-full transition-all ${
-                              currentLiveResult.result === 'PASS' ? 'bg-emerald-500' : 'bg-rose-500'
-                            }`}
-                            style={{ width: `${Math.min(currentLiveResult.anomalyScore / Math.max(currentLiveResult.threshold, 0.001) * 100, 100).toFixed(1)}%` }}
-                          />
-                          {/* Threshold marker */}
-                          <div className="absolute inset-y-0 bg-amber-400/80" style={{ left: '100%', width: '1.5px', transform: 'translateX(-0.75px)' }} />
-                        </div>
-                        {currentLiveResult.defectRegion && (
-                          <div className="text-[10px] text-rose-300 flex items-center gap-1 pt-0.5">
-                            <AlertTriangle className="w-3 h-3" />
-                            Defect region detected · confidence {currentLiveResult.defectRegion.confidence}%
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="bg-slate-900/70 border border-slate-700/50 rounded-lg px-4 py-1.5 text-slate-400 font-mono text-[11px] backdrop-blur-xs">
-                      {isLiveInspectionRunning ? 'Watching conveyor: Awaiting manufactured part in Inspection Zone...' : 'Station idle'}
-                    </div>
-                  )}
-                </div>
-              )}
-
-            </div>
-
-            {/* ACTION BAR: PRIMARY CONVEYOR CONTROLS */}
-            <div className="p-4 bg-white border-t border-slate-200 flex flex-wrap items-center justify-between gap-3">
-              
-              {/* Left Group: START / STOP LIVE INSPECTION */}
-              {activeTab === 'conveyor' ? (
-                <div className="flex flex-wrap items-center gap-3">
-                  {!isLiveInspectionRunning ? (
+                  <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800">
                     <button
-                      type="button"
-                      onClick={handleStartLiveInspection}
-                      disabled={isRequestingCamera}
-                      className="flex items-center gap-2.5 px-6 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 active:scale-98 text-white text-xs font-mono font-bold rounded-lg transition-all shadow-md shadow-emerald-600/20 cursor-pointer disabled:opacity-50"
-                    >
-                      <Play className="w-4 h-4 fill-white" />
-                      <span>{isRequestingCamera ? 'Initializing Camera...' : 'START LIVE INSPECTION'}</span>
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={handleStopLiveInspection}
-                      className="flex items-center gap-2.5 px-6 py-2.5 bg-rose-600 hover:bg-rose-700 active:scale-98 text-white text-xs font-mono font-bold rounded-lg transition-all shadow-md shadow-rose-600/20 cursor-pointer"
-                    >
-                      <Square className="w-4 h-4 fill-white" />
-                      <span>STOP LIVE INSPECTION</span>
-                    </button>
-                  )}
-
-                  {/* Camera On/Off Toggle */}
-                  {!isLiveInspectionRunning && (
-                    <button
-                      type="button"
-                      onClick={isCameraActive ? stopCamera : startCamera}
-                      className="flex items-center gap-2 px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-mono font-semibold rounded-lg border border-slate-300 transition-colors cursor-pointer"
-                    >
-                      {isCameraActive ? <VideoOff className="w-4 h-4 text-slate-500" /> : <Video className="w-4 h-4 text-slate-500" />}
-                      <span>{isCameraActive ? 'Turn Off Camera' : 'Test Camera Stream'}</span>
-                    </button>
-                  )}
-                </div>
-              ) : (
-                /* Manual Test Mode Controls */
-                <div className="flex flex-wrap items-center gap-3">
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept=".jpg,.jpeg,.png,image/jpeg,image/png,image/webp"
-                    onChange={handleManualFileUpload}
-                    className="hidden"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="flex items-center gap-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-mono font-semibold rounded-lg border border-slate-300 transition-colors cursor-pointer"
-                  >
-                    <Upload className="w-4 h-4" />
-                    <span>Upload Test Frame</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={handleRunManualInspection}
-                    disabled={!capturedImage || isAnalyzing}
-                    className="flex items-center gap-2 px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-mono font-bold rounded-lg shadow-xs cursor-pointer disabled:opacity-50"
-                  >
-                    <Sparkles className="w-4 h-4" />
-                    <span>Run Manual AI Inspection</span>
-                  </button>
-
-                  {capturedImage && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setCapturedImage(null);
-                        setInspectionResult(null);
-                      }}
-                      className="p-2 text-slate-400 hover:text-rose-600 rounded cursor-pointer"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  )}
-                </div>
-              )}
-
-              {/* Right Group: ROI Presets and Sampling FPS */}
-              <div className="flex flex-wrap items-center gap-3 font-mono text-xs">
-                {/* ROI Preset Selector */}
-                <div className="flex items-center gap-1.5 bg-slate-100 p-1 rounded-lg border border-slate-200">
-                  <span className="text-[10px] text-slate-500 px-1 font-semibold">Zone:</span>
-                  {(['compact', 'standard', 'wide'] as const).map((preset) => (
-                    <button
-                      key={preset}
-                      type="button"
-                      onClick={() => handleSetRoiPreset(preset)}
-                      className={`px-2 py-0.5 text-[11px] rounded transition-colors cursor-pointer ${
-                        roiPreset === preset
-                          ? 'bg-white text-blue-700 font-bold shadow-xs'
-                          : 'text-slate-600 hover:text-slate-900'
+                      onClick={() => setActiveViewMode('original')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                        activeViewMode === 'original'
+                          ? 'bg-blue-600 text-white shadow-md'
+                          : 'text-slate-400 hover:text-white'
                       }`}
                     >
-                      {preset === 'compact' ? '50%' : preset === 'standard' ? '70%' : '85%'}
+                      Original
                     </button>
-                  ))}
-                </div>
-
-                {/* Sampling FPS Selector */}
-                <div className="flex items-center gap-1.5 bg-slate-100 p-1 rounded-lg border border-slate-200">
-                  <span className="text-[10px] text-slate-500 px-1 font-semibold">FPS:</span>
-                  {[5, 10, 15].map((fpsVal) => (
                     <button
-                      key={fpsVal}
-                      type="button"
-                      onClick={() => handleChangeFps(fpsVal)}
-                      className={`px-2 py-0.5 text-[11px] rounded transition-colors cursor-pointer ${
-                        liveInspectionFps === fpsVal
-                          ? 'bg-white text-blue-700 font-bold shadow-xs'
-                          : 'text-slate-600 hover:text-slate-900'
+                      onClick={() => setActiveViewMode('overlay')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                        activeViewMode === 'overlay'
+                          ? 'bg-blue-600 text-white shadow-md'
+                          : 'text-slate-400 hover:text-white'
                       }`}
                     >
-                      {fpsVal}
+                      Overlay
                     </button>
-                  ))}
-                </div>
-              </div>
-
-            </div>
-
-          </div>
-
-          {/* Operational Guidance Callout */}
-          <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono text-slate-600 flex items-center justify-between gap-4">
-            <div className="flex items-center gap-2.5">
-              <Cpu className="w-4 h-4 text-blue-600 shrink-0" />
-              <span>
-                <strong>Continuous Pipeline:</strong> Sampling video feed at {liveInspectionFps} FPS. Product occupancy &amp; motion tracker triggers anomaly inspection upon entering the Inspection Zone, with automated duplicate lockout until exit.
-              </span>
-            </div>
-            <span className="text-[11px] text-slate-400 shrink-0 hidden sm:inline">
-              ISO 9001 Conveyor Spec
-            </span>
-          </div>
-
-        </div>
-
-        {/* Right Column (4 cols): Session Metrics, Status, and Diagnostics */}
-        <div className="lg:col-span-4 space-y-6">
-          
-          {/* PRODUCT COUNTER & SESSION YIELD PANEL */}
-          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs space-y-4 font-mono">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-200">
-              <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wide flex items-center gap-2">
-                <TrendingUp className="w-4 h-4 text-blue-600" />
-                <span>Conveyor Production Metrics</span>
-              </h3>
-              <span className={`w-2 h-2 rounded-full ${
-                isLiveInspectionRunning ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
-              }`} />
-            </div>
-
-            {/* Total Inspected Counter */}
-            <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between">
-              <div>
-                <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Products Inspected</span>
-                <span className="text-2xl font-bold text-slate-900 tabular-nums">
-                  {sessionInspectedCount}
-                </span>
-              </div>
-              <div className="text-right">
-                <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Production Yield</span>
-                <span className="text-base font-bold text-blue-600 tabular-nums">
-                  {yieldPct}%
-                </span>
-              </div>
-            </div>
-
-            {/* PASS / FAIL Counters */}
-            <div className="grid grid-cols-2 gap-3 text-xs">
-              <div className="p-3 bg-emerald-50/80 border border-emerald-200 rounded-lg">
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-[10px] text-emerald-800 font-bold uppercase">Conformant</span>
-                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                </div>
-                <div className="text-xl font-bold text-emerald-700 tabular-nums">
-                  {sessionPassCount}
-                </div>
-              </div>
-
-              <div className="p-3 bg-rose-50/80 border border-rose-200 rounded-lg">
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-[10px] text-rose-800 font-bold uppercase">Rejected</span>
-                  <XCircle className="w-3.5 h-3.5 text-rose-600" />
-                </div>
-                <div className="text-xl font-bold text-rose-700 tabular-nums">
-                  {sessionFailCount}
-                </div>
-              </div>
-            </div>
-
-            {/* Live Inspection Timing Metrics */}
-            <div className="pt-2 border-t border-slate-100 text-[11px] space-y-1.5 text-slate-600">
-              <div className="flex justify-between">
-                <span className="text-slate-400">Sampling Speed:</span>
-                <span className="font-semibold text-slate-900 tabular-nums">{liveDiagnostics.processingFps} FPS</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-400">Avg Inspection Time:</span>
-                <span className="font-semibold text-slate-900 tabular-nums">{liveDiagnostics.averageInferenceTimeMs} ms</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-400">Last Inspection Time:</span>
-                <span className="font-semibold text-slate-900 tabular-nums">{liveDiagnostics.lastInferenceTimeMs} ms</span>
-              </div>
-            </div>
-          </div>
-
-          {/* ACTIVE PRODUCT & PROFILE INFO */}
-          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs font-mono text-xs space-y-3">
-            <div className="flex items-center justify-between pb-2 border-b border-slate-200">
-              <h4 className="font-bold text-slate-900 uppercase text-[11px] flex items-center gap-2">
-                <ShieldCheck className="w-4 h-4 text-blue-600" />
-                <span>Station Configuration</span>
-              </h4>
-              <span className="text-[10px] text-slate-400">{currentProduct?.sku || 'SKU-N/A'}</span>
-            </div>
-
-            <div className="space-y-2 text-slate-600 text-[11px]">
-              <div className="flex justify-between">
-                <span className="text-slate-400">Target Part:</span>
-                <span className="font-semibold text-slate-900 truncate max-w-[180px]">{currentProduct?.name || 'None selected'}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-400">Rejection Threshold:</span>
-                <span className="font-semibold text-blue-700">{effectiveThreshold.toFixed(2)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-400">Normal Reference Model:</span>
-                <span className="font-semibold text-slate-900">{referenceImages.length} images</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-400">Conveyor Inspection Zone:</span>
-                <span className="font-semibold text-slate-900">
-                  {Math.round(roiConfig.width * 100)}% × {Math.round(roiConfig.height * 100)}%
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* COLLAPSIBLE PIPELINE DIAGNOSTICS */}
-          <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs font-mono text-xs">
-            <button
-              type="button"
-              onClick={() => setShowDebugInfo(!showDebugInfo)}
-              className="w-full flex items-center justify-between text-slate-700 hover:text-slate-900 font-bold transition-colors cursor-pointer"
-            >
-              <span className="flex items-center gap-1.5">
-                <Activity className="w-3.5 h-3.5 text-blue-600" />
-                <span>Live Conveyor Diagnostics</span>
-              </span>
-              <span className="text-[10px] text-slate-500 bg-slate-100 hover:bg-slate-200 px-2 py-0.5 rounded font-normal transition-colors">
-                {showDebugInfo ? 'Hide ▲' : 'Inspect ▼'}
-              </span>
-            </button>
-
-            {showDebugInfo && (
-              <div className="mt-3 pt-3 border-t border-slate-100 space-y-1.5 text-[11px] text-slate-600 animate-fadeIn max-h-[380px] overflow-y-auto pr-1">
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Camera FPS:</span>
-                  <span className="font-semibold text-slate-900">{liveDiagnostics.cameraFps} FPS</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Processing FPS:</span>
-                  <span className="font-semibold text-slate-900">{liveDiagnostics.processingFps} FPS</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Current State:</span>
-                  <span className="font-bold text-blue-700">{liveDiagnostics.currentState}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">ROI Occupancy:</span>
-                  <span className="font-semibold text-slate-900">{liveDiagnostics.roiOccupancy}%</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Product Detection Score:</span>
-                  <span className="font-semibold text-slate-900">{liveDiagnostics.productDetectionScore}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Blur / Sharpness Score:</span>
-                  <span className="font-semibold text-slate-900">{liveDiagnostics.blurScore}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Frames Sampled:</span>
-                  <span className="font-semibold text-slate-900">{liveDiagnostics.framesSampled}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Frames Inspected:</span>
-                  <span className="font-semibold text-slate-900">{liveDiagnostics.framesInspected}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Products Detected:</span>
-                  <span className="font-semibold text-slate-900">{liveDiagnostics.productsDetected}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Products Inspected:</span>
-                  <span className="font-semibold text-slate-900">{liveDiagnostics.productsInspected}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Products Skipped:</span>
-                  <span className="font-semibold text-slate-900">{liveDiagnostics.productsSkipped}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Bottleneck Status:</span>
-                  <span className={`font-bold ${liveDiagnostics.isBottleneck ? 'text-rose-600' : 'text-emerald-600'}`}>
-                    {liveDiagnostics.isBottleneck ? 'BOTTLENECK DETECTED' : 'NORMAL'}
-                  </span>
-                </div>
-                {/* INSPECTION PIPELINE & ALIGNMENT DIAGNOSTICS */}
-                {inspectionResult?.debugInfo ? (
-                  <>
-                    <div className="pt-2.5 border-t border-slate-200">
-                      <div className="font-bold text-slate-800 text-[11px] mb-1.5 flex items-center justify-between">
-                        <span>Pipeline &amp; Alignment Metrics</span>
-                        <span className="text-[10px] text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded font-mono">
-                          {inspectionResult.debugInfo.inferenceTimeMs}ms
-                        </span>
-                      </div>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Normal Reference Images:</span>
-                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.referenceImageCount} images</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Total Patches Extracted:</span>
-                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.totalPatchesExtracted}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Coreset Memory Bank:</span>
-                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.coresetSize} vectors</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Preprocessing Canvas:</span>
-                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.preprocessingDimensions}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Product Segmentation ROI:</span>
-                      <span className="font-semibold text-slate-900 truncate max-w-[190px]" title={inspectionResult.debugInfo.roiDimensions}>
-                        {inspectionResult.debugInfo.roiDimensions}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Alignment Transform:</span>
-                      <span className="font-semibold text-slate-900 truncate max-w-[190px]" title={inspectionResult.debugInfo.alignmentTransform}>
-                        {inspectionResult.debugInfo.alignmentTransform}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Translation (dX / dY):</span>
-                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.translationX}px / {inspectionResult.debugInfo.translationY}px</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Scale / Rotation:</span>
-                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.scale}x / {inspectionResult.debugInfo.rotationDeg}°</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Alignment Score:</span>
-                      <span className="font-semibold text-emerald-700">{inspectionResult.debugInfo.alignmentScore}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Image Quality Score:</span>
-                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.imageQualityScore}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Baseline Mean (μ) / Std (σ):</span>
-                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.nominalMeanDist} / {inspectionResult.debugInfo.nominalStdDist}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Baseline P50 / P90:</span>
-                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.normalScoreP50} / {inspectionResult.debugInfo.normalScoreP90}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Baseline P95 / P99:</span>
-                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.normalScoreP95} / {inspectionResult.debugInfo.normalScoreP99}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Max Patch / Top-K Dist:</span>
-                      <span className="font-semibold text-slate-900">{inspectionResult.debugInfo.maxPatchDist} / {inspectionResult.debugInfo.topKMeanDist}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Anomaly Regions Count:</span>
-                      <span className={`font-semibold ${inspectionResult.debugInfo.numberOfAnomalyRegions > 0 ? 'text-rose-600' : 'text-slate-900'}`}>
-                        {inspectionResult.debugInfo.numberOfAnomalyRegions}
-                      </span>
-                    </div>
-                    {inspectionResult.debugInfo.numberOfAnomalyRegions > 0 && (
-                      <div className="flex justify-between">
-                        <span className="text-slate-400">Strongest Region Area:</span>
-                        <span className="font-semibold text-rose-600">{inspectionResult.debugInfo.strongestRegionArea}</span>
-                      </div>
-                    )}
-                    <div className="text-[10px] text-slate-500 italic pt-1.5 border-t border-slate-100">
-                      {inspectionResult.debugInfo.calibrationStatus}
-                    </div>
-                  </>
-                ) : memoryBank ? (
-                  <>
-                    <div className="pt-2 border-t border-slate-100 flex justify-between">
-                      <span className="text-slate-400">Coreset Memory Bank:</span>
-                      <span className="font-semibold text-slate-900">{memoryBank.coresetVectors.length} vectors</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Normal Baseline Mean (μ):</span>
-                      <span className="font-semibold text-slate-900">{memoryBank.nominalMeanDist}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Normal Baseline P95:</span>
-                      <span className="font-semibold text-slate-900">{memoryBank.nominalP95}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Normal Baseline P99:</span>
-                      <span className="font-semibold text-slate-900">{memoryBank.nominalP99}</span>
-                    </div>
-                    <div className="text-[10px] text-slate-500 italic pt-1">
-                      {memoryBank.calibrationStatus}
-                    </div>
-                  </>
-                ) : null}
-              </div>
-            )}
-          </div>
-
-          {/* PERSISTENCE CONFIRMATION */}
-          {lastSavedId && (
-            <div className="p-3 bg-blue-50/80 border border-blue-200 rounded-lg text-[11px] text-blue-900 font-mono space-y-1">
-              <div className="flex items-center gap-1.5 font-bold">
-                <CheckCircle2 className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-                <span>Latest Inspection Logged to Firestore</span>
-              </div>
-              <div className="text-blue-800 truncate">
-                Record ID: <span className="font-bold">{lastSavedId}</span>
-              </div>
-              <div className="text-[10px] text-blue-600">
-                Visible in History audit trail &amp; Dashboard live metrics.
-              </div>
-            </div>
-          )}
-
-          {/* LAST RESULT DETAIL CARD */}
-          {inspectionResult && inspectionResult.result !== 'INVALID' && (
-            <div className={`bg-white border rounded-xl shadow-xs font-mono overflow-hidden ${
-              inspectionResult.result === 'PASS' ? 'border-emerald-300' : 'border-rose-300'
-            }`}>
-              {/* Verdict header */}
-              <div className={`px-4 py-3 flex items-center justify-between ${
-                inspectionResult.result === 'PASS'
-                  ? 'bg-emerald-50 border-b border-emerald-200'
-                  : 'bg-rose-50 border-b border-rose-200'
-              }`}>
-                <div className="flex items-center gap-2">
-                  {inspectionResult.result === 'PASS' ? (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                  ) : (
-                    <XCircle className="w-4 h-4 text-rose-600 shrink-0" />
-                  )}
-                  <span className={`text-sm font-bold ${
-                    inspectionResult.result === 'PASS' ? 'text-emerald-800' : 'text-rose-800'
-                  }`}>
-                    {inspectionResult.result === 'PASS' ? 'PASS — Conformant' : 'FAIL — Rejected'}
-                  </span>
-                </div>
-                <span className="text-[10px] text-slate-400">{inspectionResult.inferenceTimeMs} ms</span>
-              </div>
-
-              <div className="p-4 space-y-3 text-[11px] text-slate-600">
-                {/* Rejection reason */}
-                {inspectionResult.result === 'FAIL' && (
-                  <div className="flex items-start gap-2 p-2 bg-rose-50 border border-rose-200 rounded-lg text-rose-800">
-                    <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-rose-600" />
-                    <span>Anomaly score exceeded the configured rejection threshold.</span>
-                  </div>
-                )}
-
-                {/* Score vs threshold */}
-                <div className="space-y-1.5">
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Anomaly Score</span>
-                    <span className={`font-bold tabular-nums ${
-                      inspectionResult.result === 'FAIL' ? 'text-rose-700' : 'text-emerald-700'
-                    }`}>{inspectionResult.anomalyScore.toFixed(4)}</span>
-                  </div>
-                  <div className="relative h-2 rounded-full bg-slate-100 overflow-hidden">
-                    <div
-                      className={`absolute inset-y-0 left-0 rounded-full ${
-                        inspectionResult.result === 'PASS' ? 'bg-emerald-500' : 'bg-rose-500'
+                    <button
+                      onClick={() => setActiveViewMode('heatmap')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                        activeViewMode === 'heatmap'
+                          ? 'bg-blue-600 text-white shadow-md'
+                          : 'text-slate-400 hover:text-white'
                       }`}
-                      style={{
-                        width: `${Math.min(
-                          (inspectionResult.anomalyScore / Math.max(effectiveThreshold, 0.001)) * 100,
-                          100
-                        ).toFixed(1)}%`,
-                      }}
+                    >
+                      Shape Heatmap
+                    </button>
+                  </div>
+                </div>
+
+                {/* Display Canvas Frame */}
+                <div className="relative aspect-square w-full bg-slate-950 rounded-xl overflow-hidden border border-slate-800 flex items-center justify-center p-2">
+                  {activeViewMode === 'original' && uploadedImage && (
+                    <img src={uploadedImage} alt="Original photo" className="max-h-full max-w-full object-contain rounded-lg" />
+                  )}
+
+                  {activeViewMode === 'overlay' && (
+                    <img
+                      src={renderedOverlayUrl || uploadedImage || ''}
+                      alt="Heatmap Overlay"
+                      className="max-h-full max-w-full object-contain rounded-lg"
                     />
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Rejection Threshold</span>
-                    <span className="font-semibold text-blue-700 tabular-nums">{effectiveThreshold.toFixed(4)}</span>
-                  </div>
+                  )}
+
+                  {activeViewMode === 'heatmap' && (
+                    <img
+                      src={renderedHeatmapUrl || uploadedImage || ''}
+                      alt="Pure Heatmap"
+                      className="max-h-full max-w-full object-contain rounded-lg"
+                    />
+                  )}
                 </div>
-
-                {/* Defect region */}
-                {inspectionResult.suspectedDefectRegion && (
-                  <div className="pt-2 border-t border-slate-100 space-y-1">
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Defect Region</span>
-                      <span className="font-semibold text-rose-700">
-                        {inspectionResult.suspectedDefectRegion.width}×{inspectionResult.suspectedDefectRegion.height} px
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Region Confidence</span>
-                      <span className="font-semibold text-rose-700">
-                        {inspectionResult.suspectedDefectRegion.confidence}%
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Peak Location</span>
-                      <span className="font-semibold text-slate-900 tabular-nums">
-                        ({inspectionResult.maxAnomalyCoord.x}px, {inspectionResult.maxAnomalyCoord.y}px)
-                      </span>
-                    </div>
-                  </div>
-                )}
-
-                {/* Image views shortcut */}
-                {(inspectionResult.overlayDataUrl || inspectionResult.heatmapDataUrl) && (
-                  <div className="pt-2 border-t border-slate-100">
-                    <p className="text-[10px] text-slate-400 mb-1.5">Switch viewport view:</p>
-                    <div className="flex gap-1.5 flex-wrap">
-                      {capturedImage && (
-                        <button
-                          type="button"
-                          onClick={() => setActiveViewMode('original')}
-                          className={`px-2.5 py-1 rounded text-[10px] font-semibold border transition-colors cursor-pointer ${
-                            activeViewMode === 'original'
-                              ? 'bg-slate-900 text-white border-slate-900'
-                              : 'bg-white text-slate-600 border-slate-300 hover:border-slate-500'
-                          }`}
-                        >
-                          Original
-                        </button>
-                      )}
-                      {inspectionResult.overlayDataUrl && (
-                        <button
-                          type="button"
-                          onClick={() => setActiveViewMode('overlay')}
-                          className={`px-2.5 py-1 rounded text-[10px] font-semibold border transition-colors cursor-pointer ${
-                            activeViewMode === 'overlay'
-                              ? 'bg-slate-900 text-white border-slate-900'
-                              : 'bg-white text-slate-600 border-slate-300 hover:border-slate-500'
-                          }`}
-                        >
-                          Overlay
-                        </button>
-                      )}
-                      {inspectionResult.heatmapDataUrl && (
-                        <button
-                          type="button"
-                          onClick={() => setActiveViewMode('heatmap')}
-                          className={`px-2.5 py-1 rounded text-[10px] font-semibold border transition-colors cursor-pointer ${
-                            activeViewMode === 'heatmap'
-                              ? 'bg-slate-900 text-white border-slate-900'
-                              : 'bg-white text-slate-600 border-slate-300 hover:border-slate-500'
-                          }`}
-                        >
-                          Heatmap
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                )}
               </div>
             </div>
+          ) : (
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-12 text-center shadow-xl space-y-4">
+              <div className="w-16 h-16 bg-slate-800 text-slate-500 rounded-2xl flex items-center justify-center mx-auto">
+                <FileCheck className="w-8 h-8" />
+              </div>
+              <h3 className="text-xl font-bold text-white">Ready to Inspect</h3>
+              <p className="text-sm text-slate-400 max-w-sm mx-auto">
+                Upload a washer product photo on the left and click <strong className="text-blue-400">Analyse Shape</strong> to perform image-specific canonical matching.
+              </p>
+            </div>
           )}
-
         </div>
-
       </div>
-
     </div>
   );
 };
