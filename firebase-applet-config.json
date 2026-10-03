@@ -1,12 +1,9 @@
 {
-  "projectId": "visionqc-c9d79",
-  "appId": "1:808863715075:web:244559451e8727f7b02336",
-  "apiKey": "AIzaSyDGDs8_wQrtKiVKQzzaWTQXws02eLDNVjM",
-  "authDomain": "visionqc-c9d79.firebaseapp.com",
-  "firestoreDatabaseId": "ai-studio-visionqc-88cacc42-d615-4660-9c65-86d5e86f22e6",
-  "storageBucket": "visionqc-c9d79.firebasestorage.app",
-  "messagingSenderId": "808863715075",
-  "measurementId": "",
-  "oAuthClientId": "808863715075-4k9fk9da1jj8dej5jec2ikdiu99jv7k3.apps.googleusercontent.com",
-  "recaptchaSiteKey": ""
+  "apiKey": "AIzaSyAbWN0Z_AFkX3iGe9msDToP13YeYumGMIE",
+  "authDomain": "visionqc-d565e.firebaseapp.com",
+  "projectId": "visionqc-d565e",
+  "storageBucket": "visionqc-d565e.firebasestorage.app",
+  "messagingSenderId": "153624926172",
+  "appId": "1:153624926172:web:fd981fe08a7f010f032119",
+  "measurementId": "G-CMEM427M5X"
 }
