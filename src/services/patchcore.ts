@@ -939,27 +939,264 @@ export async function preprocessImage(imgSrc: string): Promise<PreprocessedData>
 }
 
 // ---------------------------------------------------------------------------
-// 4. Product-Coordinate Multi-Scale Patch Feature Extraction
+// 4. Shape-Based Feature Extraction (Contour / Silhouette Only)
 // ---------------------------------------------------------------------------
 
 /**
- * Extracts 32-dimensional multi-scale visual patch embeddings across the GRID_W x GRID_H grid
- * Anchored to the ALIGNED PRODUCT coordinate system
+ * Builds per-pixel shape fields from the normalised product canvas:
+ *  - silhouette:  1 where the pixel belongs to the product foreground, 0 for background
+ *  - outerDist:   Chamfer distance to the nearest outer silhouette boundary edge
+ *  - innerDist:   Chamfer distance to the nearest inner-hole boundary edge
+ *
+ * For a washer / ring geometry this captures BOTH the outer contour deformation and
+ * the inner-hole deformation. Reflections, brightness, and surface texture contribute
+ * nothing to these fields.
+ */
+function buildShapeFields(
+  data: Uint8ClampedArray, // RGBA pixels of the normalised CANVAS_W × CANVAS_H canvas
+): {
+  silhouette: Uint8Array;  // 1 = product foreground, 0 = background
+  outerDist: Float32Array; // chamfer distance to outer-contour boundary
+  innerDist: Float32Array; // chamfer distance to inner-hole boundary
+} {
+  const W = CANVAS_W;
+  const H = CANVAS_H;
+  const N = W * H;
+
+  // ------------------------------------------------------------------
+  // Step 1: build binary silhouette from the dark background (#0f172a)
+  //   background threshold: pixel is background if R<28 && G<30 && B<56
+  // ------------------------------------------------------------------
+  const silhouette = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    const r = data[i * 4];
+    const g = data[i * 4 + 1];
+    const b = data[i * 4 + 2];
+    silhouette[i] = (r < 28 && g < 30 && b < 56) ? 0 : 1;
+  }
+
+  // ------------------------------------------------------------------
+  // Step 2: Morphological closing (3×3 dilation then erosion) to fill
+  //   small holes caused by reflective specular highlights inside the
+  //   product body.
+  // ------------------------------------------------------------------
+  const dilated = new Uint8Array(N);
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      let v = 0;
+      for (let dy = -1; dy <= 1 && !v; dy++)
+        for (let dx = -1; dx <= 1 && !v; dx++)
+          v = silhouette[(y + dy) * W + (x + dx)];
+      dilated[y * W + x] = v;
+    }
+  }
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      let v = 1;
+      for (let dy = -1; dy <= 1 && v; dy++)
+        for (let dx = -1; dx <= 1 && v; dx++)
+          v = dilated[(y + dy) * W + (x + dx)];
+      silhouette[y * W + x] = v;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Step 3: Detect the inner hole — the largest connected background
+  //   region that is ENCLOSED by foreground (i.e. does not touch any
+  //   canvas border).  For a washer this is the central hole.
+  // ------------------------------------------------------------------
+  const innerMask = new Uint8Array(N); // 1 = inner hole pixel
+
+  // flood-fill from all border pixels that are background → "outer" background
+  const outerVisited = new Uint8Array(N);
+  const borderQueue: number[] = [];
+  for (let x = 0; x < W; x++) {
+    if (!silhouette[x]) { outerVisited[x] = 1; borderQueue.push(x); }
+    if (!silhouette[(H - 1) * W + x]) { outerVisited[(H - 1) * W + x] = 1; borderQueue.push((H - 1) * W + x); }
+  }
+  for (let y = 1; y < H - 1; y++) {
+    if (!silhouette[y * W]) { outerVisited[y * W] = 1; borderQueue.push(y * W); }
+    if (!silhouette[y * W + W - 1]) { outerVisited[y * W + W - 1] = 1; borderQueue.push(y * W + W - 1); }
+  }
+  let qi = 0;
+  while (qi < borderQueue.length) {
+    const idx = borderQueue[qi++];
+    const bx = idx % W;
+    const by = Math.floor(idx / W);
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (Math.abs(dx) + Math.abs(dy) !== 1) continue; // 4-connected
+        const nx = bx + dx;
+        const ny = by + dy;
+        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+        const ni = ny * W + nx;
+        if (!silhouette[ni] && !outerVisited[ni]) {
+          outerVisited[ni] = 1;
+          borderQueue.push(ni);
+        }
+      }
+    }
+  }
+  // Any background pixel NOT reached by the outer flood-fill is an inner hole
+  for (let i = 0; i < N; i++) {
+    if (!silhouette[i] && !outerVisited[i]) innerMask[i] = 1;
+  }
+
+  // ------------------------------------------------------------------
+  // Step 4: Chamfer distance transforms (fast 3×3 city-block approximation)
+  //   outerDist: distance from each pixel to the nearest outer-contour edge
+  //   innerDist: distance from each pixel to the nearest inner-hole edge
+  //
+  //   Edge pixels = pixels on the silhouette boundary:
+  //     outer edge: silhouette[i]==1 AND has a 4-connected background neighbour
+  //     inner edge: innerMask[i]==1 OR (silhouette[i]==1 AND has inner-hole neighbour)
+  // ------------------------------------------------------------------
+  const INF = 9999;
+
+  // Outer contour distance
+  const outerDist = new Float32Array(N).fill(INF);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      if (!silhouette[i]) { outerDist[i] = 0; continue; } // background itself
+      // Check if adjacent to outer background
+      let onEdge = false;
+      if (x > 0 && !silhouette[i - 1] && !innerMask[i - 1]) onEdge = true;
+      if (!onEdge && x < W - 1 && !silhouette[i + 1] && !innerMask[i + 1]) onEdge = true;
+      if (!onEdge && y > 0 && !silhouette[i - W] && !innerMask[i - W]) onEdge = true;
+      if (!onEdge && y < H - 1 && !silhouette[i + W] && !innerMask[i + W]) onEdge = true;
+      if (onEdge) outerDist[i] = 0;
+    }
+  }
+  // Forward pass
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      const v = Math.min(
+        outerDist[i - W - 1] + 1.4,
+        outerDist[i - W] + 1,
+        outerDist[i - W + 1] + 1.4,
+        outerDist[i - 1] + 1,
+        outerDist[i]
+      );
+      outerDist[i] = v;
+    }
+  }
+  // Backward pass
+  for (let y = H - 2; y >= 1; y--) {
+    for (let x = W - 2; x >= 1; x--) {
+      const i = y * W + x;
+      const v = Math.min(
+        outerDist[i + W + 1] + 1.4,
+        outerDist[i + W] + 1,
+        outerDist[i + W - 1] + 1.4,
+        outerDist[i + 1] + 1,
+        outerDist[i]
+      );
+      outerDist[i] = v;
+    }
+  }
+
+  // Inner hole distance
+  const innerDist = new Float32Array(N).fill(INF);
+  // Seed: inner-hole pixels themselves, and silhouette pixels adjacent to hole
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      if (innerMask[i]) { innerDist[i] = 0; continue; }
+      if (silhouette[i]) {
+        let adj = false;
+        if (x > 0 && innerMask[i - 1]) adj = true;
+        if (!adj && x < W - 1 && innerMask[i + 1]) adj = true;
+        if (!adj && y > 0 && innerMask[i - W]) adj = true;
+        if (!adj && y < H - 1 && innerMask[i + W]) adj = true;
+        if (adj) innerDist[i] = 0;
+      }
+    }
+  }
+  // Forward pass
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      if (innerMask[i]) continue;
+      const v = Math.min(
+        innerDist[i - W - 1] + 1.4,
+        innerDist[i - W] + 1,
+        innerDist[i - W + 1] + 1.4,
+        innerDist[i - 1] + 1,
+        innerDist[i]
+      );
+      innerDist[i] = v;
+    }
+  }
+  // Backward pass
+  for (let y = H - 2; y >= 1; y--) {
+    for (let x = W - 2; x >= 1; x--) {
+      const i = y * W + x;
+      if (innerMask[i]) continue;
+      const v = Math.min(
+        innerDist[i + W + 1] + 1.4,
+        innerDist[i + W] + 1,
+        innerDist[i + W - 1] + 1.4,
+        innerDist[i + 1] + 1,
+        innerDist[i]
+      );
+      innerDist[i] = v;
+    }
+  }
+
+  return { silhouette, outerDist, innerDist };
+}
+
+/**
+ * Extracts shape-only patch embeddings across the GRID_W × GRID_H grid.
+ *
+ * Feature vector (FEATURE_DIM = 32 dims, same as before so the rest of the
+ * pipeline is untouched):
+ *  [0]  mean outer-contour distance (normalised to [0,1])
+ *  [1]  min outer-contour distance
+ *  [2]  max outer-contour distance
+ *  [3]  std of outer-contour distance
+ *  [4]  mean inner-hole distance (normalised)
+ *  [5]  min inner-hole distance
+ *  [6]  max inner-hole distance
+ *  [7]  std of inner-hole distance
+ *  [8]  fraction of patch pixels that are product foreground (silhouette fill)
+ *  [9]  fraction of patch pixels within 3 px of the outer contour ("edge band")
+ *  [10] fraction of patch pixels within 3 px of the inner hole edge
+ *  [11] combined outer+inner edge band fraction
+ *  [12] product-relative x-position of patch centre ([-0.5, 0.5])
+ *  [13] product-relative y-position of patch centre
+ *  [14] radial distance from product centre (polar r)
+ *  [15] cos(theta) of patch-centre polar angle
+ *  [16] sin(theta) of patch-centre polar angle
+ *  [17..31] medium-scale (2×2) averages of [0..14] features
+ *           (shared patch pooling — filled below)
+ *
+ * Luminance, colour, and texture features are completely absent.
  */
 export function extractMultiScalePatches(pre: PreprocessedData): {
   finePatches: Float32Array[];
   mediumPatches: Float32Array[];
   coarsePatches: Float32Array[];
 } {
-  const { lum, rChan, gChan, bChan, gradX, gradY, gradMag, laplacian, roi } = pre;
   const W = CANVAS_W;
   const H = CANVAS_H;
   const cellW = W / GRID_W;
   const cellH = H / GRID_H;
 
+  // Build shape fields: silhouette binary mask, outer-contour chamfer distances,
+  // inner-hole chamfer distances. These contain ONLY geometric information —
+  // no luminance, colour, or texture signals.
+  const { silhouette, outerDist, innerDist } = buildShapeFields(pre.data);
+
+  // Normalisation scale: typical max meaningful chamfer distance across a patch
+  // (a patch is ~12×12 px; diagonal is ~17 px). We cap at 40 px for robustness.
+  const DIST_NORM = 40.0;
+
   const finePatches: Float32Array[] = [];
 
-  // Fine Scale: 28x21 grid (588 patches of 12x12 px)
+  // Fine Scale: GRID_W × GRID_H grid
   for (let gy = 0; gy < GRID_H; gy++) {
     for (let gx = 0; gx < GRID_W; gx++) {
       const startX = Math.floor(gx * cellW);
@@ -967,113 +1204,96 @@ export function extractMultiScalePatches(pre: PreprocessedData): {
       const startY = Math.floor(gy * cellH);
       const endY = Math.min(H, Math.floor((gy + 1) * cellH));
 
-      let meanLum = 0;
-      let varLum = 0;
-      let meanMag = 0;
-      let varMag = 0;
-      let meanGx = 0;
-      let meanGy = 0;
-      let meanR = 0;
-      let meanG = 0;
-      let meanB = 0;
-      let edgeCount = 0;
-      let strongEdgeCount = 0;
-      let meanLap = 0;
+      // Accumulate shape statistics over the patch pixels
+      let sumOuter = 0, minOuter = Infinity, maxOuter = 0;
+      let sumInner = 0, minInner = Infinity, maxInner = 0;
+      let fgCount = 0;      // silhouette == 1
+      let outerEdge = 0;    // pixels within 3 px of outer contour
+      let innerEdge = 0;    // pixels within 3 px of inner hole
       let count = 0;
 
-      const patchLums: number[] = [];
+      const outerVals: number[] = [];
+      const innerVals: number[] = [];
 
       for (let y = startY; y < endY; y++) {
         for (let x = startX; x < endX; x++) {
-          const idx = y * W + x;
-          const lVal = lum[idx];
-          const mVal = gradMag[idx];
+          const pi = y * W + x;
+          const od = Math.min(outerDist[pi], DIST_NORM) / DIST_NORM;
+          const id = Math.min(innerDist[pi], DIST_NORM) / DIST_NORM;
 
-          meanLum += lVal;
-          meanMag += mVal;
-          meanGx += Math.abs(gradX[idx]);
-          meanGy += Math.abs(gradY[idx]);
-          meanR += rChan[idx];
-          meanG += gChan[idx];
-          meanB += bChan[idx];
-          meanLap += laplacian[idx];
+          sumOuter += od;
+          if (od < minOuter) minOuter = od;
+          if (od > maxOuter) maxOuter = od;
 
-          if (mVal > 0.10) edgeCount++;
-          if (mVal > 0.28) strongEdgeCount++;
-          patchLums.push(lVal);
+          sumInner += id;
+          if (id < minInner) minInner = id;
+          if (id > maxInner) maxInner = id;
+
+          if (silhouette[pi]) fgCount++;
+          if (od < 3 / DIST_NORM) outerEdge++;
+          if (id < 3 / DIST_NORM) innerEdge++;
+
+          outerVals.push(od);
+          innerVals.push(id);
           count++;
         }
       }
 
-      if (count > 0) {
-        meanLum /= count;
-        meanMag /= count;
-        meanGx /= count;
-        meanGy /= count;
-        meanR /= count;
-        meanG /= count;
-        meanB /= count;
-        meanLap /= count;
+      const c = count || 1;
+      const meanOuter = sumOuter / c;
+      const meanInner = sumInner / c;
 
-        for (let i = 0; i < patchLums.length; i++) {
-          const dL = patchLums[i] - meanLum;
-          varLum += dL * dL;
-        }
-        varLum = Math.sqrt(varLum / count);
+      // standard deviations
+      let varOuter = 0, varInner = 0;
+      for (let k = 0; k < outerVals.length; k++) {
+        varOuter += (outerVals[k] - meanOuter) ** 2;
+        varInner += (innerVals[k] - meanInner) ** 2;
       }
+      const stdOuter = Math.sqrt(varOuter / c);
+      const stdInner = Math.sqrt(varInner / c);
 
-      patchLums.sort((a, b) => a - b);
-      const p10 = patchLums[Math.floor(count * 0.1)] || meanLum;
-      const p90 = patchLums[Math.floor(count * 0.9)] || meanLum;
-      const dynRange = p90 - p10;
-      const contrastRatio = dynRange / (p90 + p10 + 1e-4);
+      if (minOuter === Infinity) minOuter = 0;
+      if (minInner === Infinity) minInner = 0;
+
+      // Patch-centre product-relative polar coordinates
+      const pcx = (gx + 0.5) / GRID_W - 0.5;  // [-0.5, 0.5]
+      const pcy = (gy + 0.5) / GRID_H - 0.5;
+      const r = Math.sqrt(pcx * pcx + pcy * pcy);
+      const theta = Math.atan2(pcy, pcx);
 
       const feat = new Float32Array(FEATURE_DIM);
 
-      // Group 1: Luminance & Contrast (6 dims) * WEIGHT_FEATURE_LUMINANCE
-      feat[0] = meanLum * WEIGHT_FEATURE_LUMINANCE;
-      feat[1] = varLum * 2.5 * WEIGHT_FEATURE_LUMINANCE;
-      feat[2] = p10 * WEIGHT_FEATURE_LUMINANCE;
-      feat[3] = p90 * WEIGHT_FEATURE_LUMINANCE;
-      feat[4] = dynRange * 2.0 * WEIGHT_FEATURE_LUMINANCE;
-      feat[5] = contrastRatio * WEIGHT_FEATURE_LUMINANCE;
+      // [0..3] outer contour distance statistics
+      feat[0] = meanOuter;
+      feat[1] = minOuter;
+      feat[2] = maxOuter;
+      feat[3] = stdOuter;
 
-      // Group 2: Gradients & Edge Directionality (8 dims) * WEIGHT_FEATURE_GRADIENTS
-      feat[6] = meanMag * 3.5 * WEIGHT_FEATURE_GRADIENTS;
-      feat[7] = varMag * 3.0 * WEIGHT_FEATURE_GRADIENTS;
-      feat[8] = meanGx * 3.5 * WEIGHT_FEATURE_GRADIENTS;
-      feat[9] = meanGy * 3.5 * WEIGHT_FEATURE_GRADIENTS;
-      feat[10] = (Math.abs(meanGx - meanGy) / (meanGx + meanGy + 1e-4)) * WEIGHT_FEATURE_GRADIENTS;
-      feat[11] = (edgeCount / (count || 1)) * 2.5 * WEIGHT_FEATURE_GRADIENTS;
-      feat[12] = (strongEdgeCount / (count || 1)) * 3.0 * WEIGHT_FEATURE_GRADIENTS;
-      feat[13] = (meanMag > 0.04 ? meanGx / (meanMag + 1e-4) : 0) * WEIGHT_FEATURE_GRADIENTS;
+      // [4..7] inner hole distance statistics
+      feat[4] = meanInner;
+      feat[5] = minInner;
+      feat[6] = maxInner;
+      feat[7] = stdInner;
 
-      // Group 3: Color Statistics & Chromaticity (6 dims) * WEIGHT_FEATURE_COLOR
-      feat[14] = meanR * WEIGHT_FEATURE_COLOR;
-      feat[15] = meanG * WEIGHT_FEATURE_COLOR;
-      feat[16] = meanB * WEIGHT_FEATURE_COLOR;
-      feat[17] = Math.abs(meanR - meanG) * 2.5 * WEIGHT_FEATURE_COLOR;
-      feat[18] = Math.abs(meanR - meanB) * 2.5 * WEIGHT_FEATURE_COLOR;
-      feat[19] = Math.abs(meanG - meanB) * 2.5 * WEIGHT_FEATURE_COLOR;
+      // [8..11] silhouette occupancy & edge band fractions
+      feat[8]  = fgCount / c;
+      feat[9]  = outerEdge / c;
+      feat[10] = innerEdge / c;
+      feat[11] = (outerEdge + innerEdge) / c;
 
-      // Group 4: Texture & High-Frequency Response (8 dims) * WEIGHT_FEATURE_TEXTURE
-      feat[20] = meanLap * 4.0 * WEIGHT_FEATURE_TEXTURE;
-      feat[21] = varLum > 0.03 ? meanMag / (varLum + 1e-4) : 0 * WEIGHT_FEATURE_TEXTURE;
-      feat[22] = (feat[11] * feat[6]) * WEIGHT_FEATURE_TEXTURE;
-      feat[23] = Math.sin(meanLum * Math.PI) * WEIGHT_FEATURE_TEXTURE;
-      feat[24] = Math.cos(meanLum * Math.PI) * WEIGHT_FEATURE_TEXTURE;
-      feat[25] = (meanLap / (meanMag + 1e-4)) * WEIGHT_FEATURE_TEXTURE;
-      feat[26] = feat[1] * feat[7] * WEIGHT_FEATURE_TEXTURE;
-      feat[27] = Math.min(1.0, varLum * 5.0) * WEIGHT_FEATURE_TEXTURE;
+      // [12..16] product-relative spatial / polar
+      feat[12] = pcx;
+      feat[13] = pcy;
+      feat[14] = r;
+      feat[15] = Math.cos(theta);
+      feat[16] = Math.sin(theta);
 
-      // Group 5: Product-Relative Spatial Coordinates (4 dims) * WEIGHT_FEATURE_SPATIAL
-      // Measured relative to the centered product (0 at center), heavily bounded
-      feat[28] = ((gx - GRID_W / 2) / GRID_W) * WEIGHT_FEATURE_SPATIAL;
-      feat[29] = ((gy - GRID_H / 2) / GRID_H) * WEIGHT_FEATURE_SPATIAL;
-      feat[30] = Math.sqrt(((gx - GRID_W / 2) / GRID_W) ** 2 + ((gy - GRID_H / 2) / GRID_H) ** 2) * WEIGHT_FEATURE_SPATIAL;
-      feat[31] = roi.saliencyMap[gy * GRID_W + gx] * WEIGHT_FEATURE_SPATIAL;
+      // [17..31] mirror of [0..14] (used for medium-scale pooling alignment;
+      // identical values ensure the pooled medium/coarse patches stay in the
+      // same feature space as fine patches after L2 normalisation)
+      for (let f = 0; f < 15; f++) feat[17 + f] = feat[f];
 
-      // L2 Normalize feature vector
+      // L2 Normalize
       let norm = 0;
       for (let f = 0; f < FEATURE_DIM; f++) norm += feat[f] * feat[f];
       norm = Math.sqrt(norm) || 1;
@@ -1083,7 +1303,7 @@ export function extractMultiScalePatches(pre: PreprocessedData): {
     }
   }
 
-  // Medium Scale: 14x10 pooled blocks (2x2 fine patches)
+  // Medium Scale: 14×10 pooled blocks (2×2 fine patches)
   const medW = Math.floor(GRID_W / 2);
   const medH = Math.floor(GRID_H / 2);
   const mediumPatches: Float32Array[] = [];
@@ -1112,7 +1332,7 @@ export function extractMultiScalePatches(pre: PreprocessedData): {
     }
   }
 
-  // Coarse Scale: 7x5 pooled blocks (4x4 fine patches)
+  // Coarse Scale: 7×5 pooled blocks (4×4 fine patches)
   const coarseW = Math.floor(GRID_W / 4);
   const coarseH = Math.floor(GRID_H / 4);
   const coarsePatches: Float32Array[] = [];

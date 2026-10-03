@@ -39,9 +39,10 @@ setPersistence(auth, browserLocalPersistence).catch((err) => {
 });
 
 // Initialize Firestore using the (default) database instance
-export const db = (!firebaseConfig.firestoreDatabaseId || firebaseConfig.firestoreDatabaseId === '(default)')
+const dbConfig = firebaseConfig as typeof firebaseConfig & { firestoreDatabaseId?: string };
+export const db = (!dbConfig.firestoreDatabaseId || dbConfig.firestoreDatabaseId === '(default)')
   ? getFirestore(app)
-  : getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  : getFirestore(app, dbConfig.firestoreDatabaseId);
 
 // Test connection on boot per Firebase skill guidelines
 async function testConnection() {
